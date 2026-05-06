@@ -1,0 +1,14 @@
+1. Abro VS Code en la carpeta aeropuerto_yolo.
+    cd "C:\Users\User\Desktop\club proyecto\aeropuerto_yolo"
+
+2. Abro una terminal y activo el entorno:
+   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+   .\.venv\Scripts\Activate.ps1
+
+3. Compruebo que aparece (.venv) al principio de la terminal.
+
+4. Ejecuto YOLO:
+   python detectar_personas.py
+
+5. Reviso el resultado en:
+   C:\Users\User\Desktop\club proyecto\runs\detect\predict

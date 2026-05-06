@@ -1,0 +1,12 @@
+.venv/
+*/.venv/
+venv/
+__pycache__/
+*.pyc
+
+runs/
+*.pt
+*.avi
+*.mp4
+*.mov
+*.mkv
