@@ -1,0 +1,419 @@
+"""
+queue_engine.py
+===============
+Motor de teoría de colas M/M/c para gestión dinámica de aeropuerto.
+Basado en el flujo: Entrada → Check-in / Bag Drop / Directo
+                    → Seguridad → Sin/Con Pasaporte → Embarque
+
+Uso:
+    python queue_engine.py --csv outputs/lecturas_aeropuerto.csv
+    python queue_engine.py --demo          # ejecuta con datos simulados
+"""
+
+import math
+import argparse
+import csv
+import os
+from dataclasses import dataclass, field
+from typing import Optional
+from datetime import datetime
+
+# ============================================================
+# CONFIGURACIÓN DE ZONAS
+# ============================================================
+
+# Tiempos de servicio medios por persona (minutos) en cada zona
+TIEMPOS_SERVICIO = {
+    "checkin":     3.5,   # minutos por pasajero en mostrador
+    "seguridad":   1.2,   # minutos por pasajero en arco
+    "pasaportes":  2.0,   # minutos por pasajero en cabina
+    "embarque":    0.5,   # minutos por pasajero en puerta
+}
+
+# Cabinas/carriles disponibles por zona (mín y máx operativos)
+CABINAS_CONFIG = {
+    "checkin":    {"min": 2, "max": 12},
+    "seguridad":  {"min": 1, "max": 6},
+    "pasaportes": {"min": 1, "max": 8},
+    "embarque":   {"min": 1, "max": 4},
+}
+
+# Umbrales de espera (minutos) para abrir/cerrar cabinas
+UMBRALES = {
+    "abrir":   5.0,   # si Wq > 5 min → abrir cabina
+    "cerrar":  1.5,   # si Wq < 1.5 min con cabinas extra → cerrar una
+    "critico": 10.0,  # alarma crítica
+}
+
+# Reparto de flujo en seguridad: % que lleva pasaporte
+RATIO_PASAPORTES = 0.45   # 45% va a control de pasaportes
+
+# ============================================================
+# MODELO M/M/c
+# ============================================================
+
+@dataclass
+class ResultadoCola:
+    zona:              str
+    lambda_arr:        float   # tasa de llegada (personas/min)
+    mu_servicio:       float   # tasa de servicio por cabina (personas/min)
+    c_activas:         int     # cabinas activas ahora
+    rho:               float   # utilización del sistema (0-1)
+    Lq:                float   # personas esperando en cola
+    Wq:                float   # tiempo medio de espera en cola (min)
+    W:                 float   # tiempo medio en el sistema (min)
+    P0:                float   # probabilidad sistema vacío
+    cabinas_recomendadas: int  # cabinas que debería haber
+    accion:            str     # "OK", "ABRIR", "CERRAR", "CRITICO"
+    mensaje:           str
+
+
+def erlang_c(c: int, rho_total: float) -> float:
+    """
+    Calcula P(esperar) según la fórmula de Erlang-C (M/M/c).
+    rho_total = lambda / mu  (sin dividir entre c)
+    """
+    if c <= 0:
+        return 1.0
+    a = rho_total  # intensidad de tráfico total
+    rho = a / c    # utilización por servidor
+
+    if rho >= 1.0:
+        return 1.0  # sistema inestable → siempre hay espera
+
+    # Suma de la serie para P0
+    suma = sum((a ** k) / math.factorial(k) for k in range(c))
+    ultimo_termino = (a ** c) / (math.factorial(c) * (1 - rho))
+    p0 = 1.0 / (suma + ultimo_termino)
+
+    # Probabilidad de esperar (Erlang-C)
+    ec = ultimo_termino * p0
+    return ec
+
+
+def calcular_cola_mmc(zona: str, lambda_arr: float, c: int) -> ResultadoCola:
+    """
+    Calcula métricas M/M/c para una zona dada.
+
+    Parámetros
+    ----------
+    zona       : nombre de la zona
+    lambda_arr : personas que llegan por minuto
+    c          : número de cabinas/carriles activos
+    """
+    mu = 1.0 / TIEMPOS_SERVICIO[zona]   # tasa de servicio por cabina
+    a  = lambda_arr / mu                 # intensidad de tráfico total
+    cfg = CABINAS_CONFIG[zona]
+
+    # Sistema inestable: necesitamos al menos ceil(a)+1 servidores
+    c_min_estable = math.ceil(a) + 1 if a >= c else c
+
+    # Forzar estabilidad para el cálculo
+    c_calc = max(c, c_min_estable)
+    rho = a / c_calc
+
+    # Métricas
+    Cw  = erlang_c(c_calc, a)
+    Lq  = Cw * rho / (1 - rho) if rho < 1 else float("inf")
+    Wq  = Lq / lambda_arr if lambda_arr > 0 else 0.0
+    W   = Wq + TIEMPOS_SERVICIO[zona]
+
+    # P0 (probabilidad sistema vacío)
+    suma_p0 = sum((a ** k) / math.factorial(k) for k in range(c_calc))
+    ultimo   = (a ** c_calc) / (math.factorial(c_calc) * (1 - rho))
+    P0 = 1.0 / (suma_p0 + ultimo) if (suma_p0 + ultimo) > 0 else 0.0
+
+    # Cabinas recomendadas: mínimo c tal que Wq <= umbral_abrir
+    c_rec = cfg["min"]
+    for c_test in range(cfg["min"], cfg["max"] + 1):
+        rho_test = a / c_test
+        if rho_test >= 1.0:
+            continue
+        Cw_test  = erlang_c(c_test, a)
+        Lq_test  = Cw_test * rho_test / (1 - rho_test)
+        Wq_test  = Lq_test / lambda_arr if lambda_arr > 0 else 0.0
+        if Wq_test <= UMBRALES["abrir"]:
+            c_rec = c_test
+            break
+    else:
+        c_rec = cfg["max"]  # saturado → máximas cabinas
+
+    c_rec = max(cfg["min"], min(c_rec, cfg["max"]))
+
+    # Acción recomendada
+    if Wq >= UMBRALES["critico"]:
+        accion  = "CRITICO"
+        mensaje = f"⚠️  CRÍTICO: {Wq:.1f} min de espera. Abrir todas las cabinas posibles."
+    elif c < c_rec:
+        accion  = "ABRIR"
+        mensaje = f"↑  Abrir {c_rec - c} cabina(s) más ({c} → {c_rec}). Wq actual: {Wq:.1f} min."
+    elif c > c_rec and c > cfg["min"]:
+        accion  = "CERRAR"
+        mensaje = f"↓  Cerrar {c - c_rec} cabina(s) ({c} → {c_rec}). Wq actual: {Wq:.1f} min."
+    else:
+        accion  = "OK"
+        mensaje = f"✓  Operación óptima con {c} cabinas. Wq: {Wq:.1f} min."
+
+    return ResultadoCola(
+        zona=zona,
+        lambda_arr=lambda_arr,
+        mu_servicio=mu,
+        c_activas=c,
+        rho=min(rho, 1.0),
+        Lq=Lq,
+        Wq=Wq,
+        W=W,
+        P0=P0,
+        cabinas_recomendadas=c_rec,
+        accion=accion,
+        mensaje=mensaje,
+    )
+
+
+# ============================================================
+# ESTADO DEL SISTEMA (cabinas activas por zona)
+# ============================================================
+
+@dataclass
+class EstadoSistema:
+    cabinas: dict = field(default_factory=lambda: {
+        "checkin":    4,
+        "seguridad":  2,
+        "pasaportes": 2,
+        "embarque":   2,
+    })
+
+    def actualizar(self, zona: str, recomendado: int):
+        cfg = CABINAS_CONFIG[zona]
+        self.cabinas[zona] = max(cfg["min"], min(recomendado, cfg["max"]))
+
+
+# ============================================================
+# PARSER DE CSV (salida del script YOLO)
+# ============================================================
+
+def leer_ultima_lectura_csv(csv_path: str) -> Optional[dict]:
+    """
+    Lee la última fila del CSV generado por el script YOLO multi-zona.
+    Columnas esperadas: timestamp, checkin, bagdrop, seguridad, pasaportes, embarque
+    """
+    if not os.path.exists(csv_path):
+        print(f"[ERROR] No se encontró el CSV: {csv_path}")
+        return None
+
+    ultima = None
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            ultima = row
+
+    if ultima is None:
+        print("[ERROR] CSV vacío.")
+        return None
+
+    # Convertir a enteros, ignorar campos no numéricos
+    resultado = {}
+    for k, v in ultima.items():
+        if k == "timestamp":
+            resultado[k] = v
+            continue
+        try:
+            resultado[k] = int(float(v)) if v not in ("", "None", "null") else 0
+        except ValueError:
+            resultado[k] = 0
+
+    return resultado
+
+
+def personas_a_lambda(personas: int, ventana_minutos: float = 5.0) -> float:
+    """
+    Convierte el conteo puntual de personas detectadas a tasa de llegada (λ).
+    Asumimos que las personas detectadas en pantalla representan
+    las que han llegado en los últimos `ventana_minutos` minutos.
+    """
+    return personas / ventana_minutos if ventana_minutos > 0 else 0.0
+
+
+# ============================================================
+# MOTOR PRINCIPAL
+# ============================================================
+
+def ejecutar_analisis(lectura: dict, estado: EstadoSistema) -> list[ResultadoCola]:
+    """
+    Dado un snapshot de personas por zona, calcula el estado de cada cola
+    y devuelve las recomendaciones.
+    """
+    resultados = []
+
+    # --- Check-in ---
+    if "checkin" in lectura:
+        lam = personas_a_lambda(lectura.get("checkin", 0))
+        r = calcular_cola_mmc("checkin", lam, estado.cabinas["checkin"])
+        estado.actualizar("checkin", r.cabinas_recomendadas)
+        resultados.append(r)
+
+    # --- Seguridad (agrega checkin + bagdrop + directo) ---
+    # Personas en seguridad = detectadas directamente en esa zona
+    if "seguridad" in lectura:
+        lam_seg = personas_a_lambda(lectura.get("seguridad", 0))
+        r = calcular_cola_mmc("seguridad", lam_seg, estado.cabinas["seguridad"])
+        estado.actualizar("seguridad", r.cabinas_recomendadas)
+        resultados.append(r)
+
+        # Flujo derivado hacia pasaportes (ratio configurable)
+        lam_pas = lam_seg * RATIO_PASAPORTES
+        if "pasaportes" in lectura:
+            # Si hay lectura directa, usarla; si no, usar la estimada
+            lam_pas = personas_a_lambda(lectura.get("pasaportes", 0)) or lam_pas
+        r = calcular_cola_mmc("pasaportes", lam_pas, estado.cabinas["pasaportes"])
+        estado.actualizar("pasaportes", r.cabinas_recomendadas)
+        resultados.append(r)
+
+    # --- Embarque ---
+    if "embarque" in lectura:
+        lam = personas_a_lambda(lectura.get("embarque", 0))
+        r = calcular_cola_mmc("embarque", lam, estado.cabinas["embarque"])
+        estado.actualizar("embarque", r.cabinas_recomendadas)
+        resultados.append(r)
+
+    return resultados
+
+
+# ============================================================
+# SALIDA POR CONSOLA
+# ============================================================
+
+COLORES = {
+    "OK":      "\033[92m",   # verde
+    "ABRIR":   "\033[93m",   # amarillo
+    "CERRAR":  "\033[96m",   # cyan
+    "CRITICO": "\033[91m",   # rojo
+    "RESET":   "\033[0m",
+}
+
+def imprimir_informe(resultados: list[ResultadoCola], estado: EstadoSistema, timestamp: str = ""):
+    ancho = 70
+    print("\n" + "=" * ancho)
+    print("  SISTEMA DE GESTIÓN DE COLAS — AEROPUERTO")
+    print(f"  Timestamp: {timestamp or datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * ancho)
+
+    for r in resultados:
+        color = COLORES.get(r.accion, "")
+        reset = COLORES["RESET"]
+        print(f"\n  ZONA: {r.zona.upper()}")
+        print(f"  {'─' * 40}")
+        print(f"  Llegadas (λ):        {r.lambda_arr:.2f} personas/min")
+        print(f"  Cabinas activas (c): {r.c_activas}")
+        print(f"  Utilización (ρ):     {r.rho:.1%}")
+        print(f"  Cola media (Lq):     {r.Lq:.1f} personas")
+        print(f"  Espera media (Wq):   {r.Wq:.1f} min")
+        print(f"  Tiempo sistema (W):  {r.W:.1f} min")
+        print(f"  {color}▶ {r.mensaje}{reset}")
+
+    print("\n" + "=" * ancho)
+    print("  ESTADO ACTUALIZADO DE CABINAS")
+    print("  " + "─" * 40)
+    for zona, n in estado.cabinas.items():
+        cfg = CABINAS_CONFIG[zona]
+        barra = "█" * n + "░" * (cfg["max"] - n)
+        print(f"  {zona:<12} [{barra}] {n}/{cfg['max']}")
+    print("=" * ancho + "\n")
+
+
+def guardar_informe_csv(resultados: list[ResultadoCola], output_path: str = "outputs/informe_colas.csv"):
+    """Guarda el informe en CSV para trazabilidad."""
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    es_nuevo = not os.path.exists(output_path)
+
+    campos = ["timestamp", "zona", "lambda_arr", "c_activas", "rho",
+              "Lq", "Wq", "W", "cabinas_recomendadas", "accion"]
+
+    with open(output_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=campos)
+        if es_nuevo:
+            writer.writeheader()
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for r in resultados:
+            writer.writerow({
+                "timestamp":            ts,
+                "zona":                 r.zona,
+                "lambda_arr":           round(r.lambda_arr, 3),
+                "c_activas":            r.c_activas,
+                "rho":                  round(r.rho, 3),
+                "Lq":                   round(r.Lq, 2),
+                "Wq":                   round(r.Wq, 2),
+                "W":                    round(r.W, 2),
+                "cabinas_recomendadas": r.cabinas_recomendadas,
+                "accion":               r.accion,
+            })
+    print(f"  Informe guardado en: {output_path}")
+
+
+# ============================================================
+# MODO DEMO
+# ============================================================
+
+ESCENARIOS_DEMO = [
+    {
+        "descripcion": "Mañana tranquila (baja ocupación)",
+        "lectura": {"timestamp": "07:00", "checkin": 8,  "seguridad": 5,  "pasaportes": 3,  "embarque": 4},
+    },
+    {
+        "descripcion": "Hora punta (alta ocupación)",
+        "lectura": {"timestamp": "09:30", "checkin": 42, "seguridad": 35, "pasaportes": 18, "embarque": 25},
+    },
+    {
+        "descripcion": "Saturación crítica",
+        "lectura": {"timestamp": "10:15", "checkin": 80, "seguridad": 70, "pasaportes": 40, "embarque": 55},
+    },
+    {
+        "descripcion": "Vuelta a la normalidad",
+        "lectura": {"timestamp": "13:00", "checkin": 15, "seguridad": 12, "pasaportes": 6,  "embarque": 8},
+    },
+]
+
+def modo_demo():
+    print("\n🛫  MODO DEMO — Simulación de escenarios de aeropuerto\n")
+    estado = EstadoSistema()
+
+    for escenario in ESCENARIOS_DEMO:
+        print(f"\n  ▶ Escenario: {escenario['descripcion']}")
+        resultados = ejecutar_analisis(escenario["lectura"], estado)
+        imprimir_informe(resultados, estado, escenario["lectura"]["timestamp"])
+        input("  [Enter para siguiente escenario...]")
+
+
+# ============================================================
+# PUNTO DE ENTRADA
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser(description="Motor de colas M/M/c para aeropuerto")
+    parser.add_argument("--csv",  type=str, help="Ruta al CSV generado por YOLO")
+    parser.add_argument("--demo", action="store_true", help="Ejecutar con datos de demo")
+    parser.add_argument("--output-csv", type=str, default="outputs/informe_colas.csv",
+                        help="Ruta para guardar el informe de colas")
+    args = parser.parse_args()
+
+    estado = EstadoSistema()
+
+    if args.demo:
+        modo_demo()
+        return
+
+    if args.csv:
+        lectura = leer_ultima_lectura_csv(args.csv)
+        if lectura is None:
+            return
+        print(f"\n  Lectura cargada: {lectura}")
+        resultados = ejecutar_analisis(lectura, estado)
+        imprimir_informe(resultados, estado, lectura.get("timestamp", ""))
+        guardar_informe_csv(resultados, args.output_csv)
+        return
+
+    parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
