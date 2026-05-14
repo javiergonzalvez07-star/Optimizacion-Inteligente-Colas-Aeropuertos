@@ -1689,3 +1689,8 @@ timestamp,zona,lambda_arr,mu_servicio,c_activas,rho,Lq,Wq,W,estable,cabinas_reco
 2026-05-14 14:26:13,seguridad,2.2,0.833,4,0.66,0.72,0.33,1.53,True,3,CERRAR
 2026-05-14 14:26:13,pasaportes,0.698,0.5,2,0.698,1.32,1.89,3.89,True,2,OK
 2026-05-14 14:26:13,embarque,1.751,2.0,1,0.876,6.16,3.52,4.02,True,1,OK
+2026-05-14 14:26:16,checkin,1.12,0.286,4,0.98,46.84,41.82,45.32,True,5,CRITICO
+2026-05-14 14:26:16,bagdrop,0.8,0.5,2,0.8,2.84,3.56,5.56,True,2,OK
+2026-05-14 14:26:16,seguridad,3.0,0.833,3,1.0,inf,inf,inf,False,4,CRITICO
+2026-05-14 14:26:16,pasaportes,1.237,0.5,2,1.0,inf,inf,inf,False,3,CRITICO
+2026-05-14 14:26:16,embarque,2.181,2.0,1,1.0,inf,inf,inf,False,2,CRITICO
