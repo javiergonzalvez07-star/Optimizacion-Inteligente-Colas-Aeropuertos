@@ -1,14 +1,39 @@
-1. Abro VS Code en la carpeta aeropuerto_yolo.
-    cd "C:\Users\User\Desktop\club proyecto\aeropuerto_yolo"
+SIMULADOR
+=========
 
-2. Abro una terminal y activo el entorno:
-   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-   .\.venv\Scripts\Activate.ps1
+Terminal 1: generar datos
 
-3. Compruebo que aparece (.venv) al principio de la terminal.
+python colas/simulador_lecturas_aeropuerto.py
 
-4. Ejecuto YOLO:
-   python detectar_personas.py
+Terminal 2: aplicar sistema de colas
 
-5. Reviso el resultado en:
-   C:\Users\User\Desktop\club proyecto\runs\detect\predict
+python colas/queue_engine.py --watch
+
+Cuando ya tengas datos suficientes, paras ambos con Ctrl+C.
+
+Para comparar:
+
+python colas/comparador_escenarios.py
+
+
+YOLO
+====
+
+Terminal 1: generar datos con YOLO
+
+cd aeropuerto_yolo
+python escaneo_aeropuerto.py
+python escaneo_aeropuerto.py
+python escaneo_aeropuerto.py
+
+Terminal 2: aplicar sistema de colas
+
+cd ..
+python colas/queue_engine.py --watch --csv aeropuerto_yolo/outputs/lecturas_aeropuerto.csv
+
+Cuando ya tengas datos suficientes, paras el watch con Ctrl+C.
+
+Para comparar:
+
+python colas/comparador_escenarios.py --csv aeropuerto_yolo/outputs/lecturas_aeropuerto.csv --output outputs/comparacion_escenarios_yolo.csv
+

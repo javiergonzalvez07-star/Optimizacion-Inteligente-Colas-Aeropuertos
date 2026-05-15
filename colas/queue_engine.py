@@ -4,6 +4,33 @@ queue_engine.py
 
 Motor de teoría de colas M/M/c para gestión dinámica de aeropuerto.
 
+MEJORA PRINCIPAL
+----------------
+Este motor NO estima lambda como:
+
+    lambda = personas_detectadas / ventana
+
+porque eso confunde ocupación con tasa de llegada.
+
+Ahora estima las llegadas mediante balance temporal entre dos mediciones:
+
+    cola_actual = cola_anterior + llegadas - atendidos
+
+Por tanto:
+
+    llegadas = cola_actual - cola_anterior + atendidos
+
+y:
+
+    lambda = llegadas / minutos_transcurridos
+
+Esto permite estimar de forma más realista:
+- llegadas por minuto,
+- espera actual,
+- tiempo para alguien que entra nuevo,
+- predicción de cola en 5, 10 y 15 minutos,
+- recomendación de cabinas.
+
 Arquitectura modelada:
 
 Entrada
@@ -18,23 +45,31 @@ Entrada
         ↓               ↓
         └────── Embarque ──────
 
-El sistema puede funcionar con:
-1. Lecturas reales de YOLO guardadas en CSV.
-2. Lecturas sintéticas generadas por simulador_lecturas_aeropuerto.py.
+CSV entrada esperado:
+    outputs/lecturas_aeropuerto.csv
 
-IMPORTANTE:
-Este archivo está dentro de la carpeta /colas.
-Por eso el CSV se lee una carpeta por encima, en:
+Columnas recomendadas:
+    timestamp,
+    entrada,
+    checkin,
+    bagdrop,
+    directo_seguridad,
+    seguridad,
+    con_pasaportes,
+    sin_pasaportes,
+    pasaportes,
+    embarque
 
-    ../outputs/lecturas_aeropuerto.csv
+CSV salida generado:
+    outputs/informe_colas.csv
 
-Uso básico:
+Uso:
     python colas/queue_engine.py
 
 Modo continuo:
     python colas/queue_engine.py --watch
 
-Modo demo interno:
+Modo demo:
     python colas/queue_engine.py --demo
 """
 
@@ -65,17 +100,27 @@ OUTPUT_INFORME_DEFAULT = os.path.join(OUTPUT_DIR, "informe_colas.csv")
 
 INTERVALO_WATCH_SEGUNDOS = 3
 
-# Esta ventana convierte ocupación observada en una aproximación de tasa de llegada.
-# Para una demo vale; en un aeropuerto real habría que estimar entradas/salidas por tracking.
-VENTANA_ESTIMACION_MINUTOS = 5.0
+# Si el timestamp no se puede parsear o es inválido, se usa este intervalo.
+DELTA_T_FALLBACK_MINUTOS = 1.0
+
+# Horizontes de predicción que se guardan en el CSV.
+HORIZONTES_PREDICCION = [5, 10, 15]
 
 
 # ============================================================
 # CONFIGURACIÓN DE ZONAS
 # ============================================================
 
+ZONAS_MODELO = [
+    "checkin",
+    "bagdrop",
+    "seguridad",
+    "pasaportes",
+    "embarque",
+]
+
 TIEMPOS_SERVICIO = {
-    "checkin": 3.5,
+    "checkin": 3.5,      # min/persona/cabina
     "bagdrop": 2.0,
     "seguridad": 1.2,
     "pasaportes": 2.0,
@@ -99,20 +144,18 @@ CABINAS_INICIALES = {
 }
 
 UMBRALES = {
-    "abrir": 5.0,
-    "cerrar": 1.5,
-    "critico": 10.0,
+    "abrir": 5.0,       # min
+    "cerrar": 1.5,      # min
+    "critico": 10.0,    # min
 }
 
-# Reparto de flujo desde entrada.
-# Solo se usa si el CSV trae una columna "entrada".
+# Se usan solo como fallback si falta una columna concreta.
 RATIO_ENTRADA = {
     "checkin": 0.35,
     "bagdrop": 0.25,
     "directo_seguridad": 0.40,
 }
 
-# Reparto después de seguridad.
 RATIO_CON_PASAPORTES = 0.45
 RATIO_SIN_PASAPORTES = 0.55
 
@@ -124,15 +167,31 @@ RATIO_SIN_PASAPORTES = 0.55
 @dataclass
 class ResultadoCola:
     zona: str
+
+    personas_anterior: int
+    personas_actual: int
+    delta_t_min: float
+
+    atendidos_estimados: float
+    llegadas_estimadas: float
+
     lambda_arr: float
     mu_servicio: float
+    capacidad_actual: float
     c_activas: int
+
     rho: float
     Lq: float
     Wq: float
     W: float
     P0: float
     estable: bool
+
+    espera_nuevo_actual: float
+    tiempo_total_nuevo_actual: float
+
+    predicciones: dict
+
     cabinas_recomendadas: int
     accion: str
     mensaje: str
@@ -148,12 +207,98 @@ class EstadoSistema:
 
 
 # ============================================================
+# UTILIDADES
+# ============================================================
+
+def formato_float(valor: float, decimales: int = 1) -> str:
+    if valor == float("inf") or not math.isfinite(valor):
+        return "inf"
+
+    return f"{valor:.{decimales}f}"
+
+
+def redondear_csv(valor: float, decimales: int = 2):
+    if valor == float("inf") or not math.isfinite(valor):
+        return "inf"
+
+    return round(valor, decimales)
+
+
+def limpiar_entero(valor) -> int:
+    if valor in ("", "None", "null", None):
+        return 0
+
+    try:
+        return int(float(valor))
+    except ValueError:
+        return 0
+
+
+def parsear_timestamp(ts: str) -> Optional[datetime]:
+    """
+    Intenta convertir distintos formatos habituales de timestamp.
+    """
+
+    if ts is None:
+        return None
+
+    ts = str(ts).strip()
+
+    if not ts:
+        return None
+
+    formatos = [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%H:%M:%S",
+        "%H:%M",
+    ]
+
+    for fmt in formatos:
+        try:
+            dt = datetime.strptime(ts, fmt)
+
+            # Si solo viene hora, le añadimos la fecha actual para poder restar.
+            if fmt in ("%H:%M:%S", "%H:%M"):
+                hoy = datetime.now()
+                dt = dt.replace(year=hoy.year, month=hoy.month, day=hoy.day)
+
+            return dt
+        except ValueError:
+            continue
+
+    return None
+
+
+def calcular_delta_t_min(lectura_anterior: dict, lectura_actual: dict) -> float:
+    """
+    Calcula los minutos entre dos mediciones.
+    Si no puede calcularlo, usa DELTA_T_FALLBACK_MINUTOS.
+    """
+
+    ts_prev = parsear_timestamp(lectura_anterior.get("timestamp", ""))
+    ts_curr = parsear_timestamp(lectura_actual.get("timestamp", ""))
+
+    if ts_prev is None or ts_curr is None:
+        return DELTA_T_FALLBACK_MINUTOS
+
+    delta = (ts_curr - ts_prev).total_seconds() / 60.0
+
+    if delta <= 0:
+        return DELTA_T_FALLBACK_MINUTOS
+
+    return delta
+
+
+# ============================================================
 # MODELO M/M/c
 # ============================================================
 
 def erlang_c(c: int, a: float) -> float:
     """
-    Calcula la probabilidad de esperar en una cola M/M/c.
+    Probabilidad de esperar en una cola M/M/c.
 
     c = número de servidores
     a = lambda / mu = intensidad total de tráfico
@@ -171,6 +316,7 @@ def erlang_c(c: int, a: float) -> float:
         suma = sum((a ** k) / math.factorial(k) for k in range(c))
         ultimo = (a ** c) / (math.factorial(c) * (1 - rho))
         p0 = 1.0 / (suma + ultimo)
+
         return ultimo * p0
     except OverflowError:
         return 1.0
@@ -179,6 +325,11 @@ def erlang_c(c: int, a: float) -> float:
 def calcular_metricas_mmc(lambda_arr: float, mu: float, c: int):
     """
     Calcula rho, Lq, Wq, W, P0 y estabilidad para una cola M/M/c.
+
+    Unidades:
+    - lambda_arr: personas/min
+    - mu: personas/min/cabina
+    - Wq y W: minutos
     """
 
     if lambda_arr <= 0:
@@ -205,6 +356,7 @@ def calcular_metricas_mmc(lambda_arr: float, mu: float, c: int):
         }
 
     Cw = erlang_c(c, a)
+
     Lq = Cw * rho / (1 - rho)
     Wq = Lq / lambda_arr
     W = Wq + (1.0 / mu)
@@ -223,15 +375,244 @@ def calcular_metricas_mmc(lambda_arr: float, mu: float, c: int):
     }
 
 
-def recomendar_cabinas(zona: str, lambda_arr: float) -> int:
+# ============================================================
+# ESTIMACIÓN DE FLUJO POR DIFERENCIA ENTRE MEDICIONES
+# ============================================================
+
+def estimar_llegadas_por_balance(
+    zona: str,
+    personas_anterior: int,
+    personas_actual: int,
+    delta_t_min: float,
+    cabinas_activas: int
+):
     """
-    Devuelve el mínimo número de cabinas necesario para que Wq <= umbral de apertura.
+    Estima las llegadas usando:
+
+        llegadas = personas_actual - personas_anterior + atendidos
+
+    donde:
+
+        atendidos = mu * cabinas_activas * delta_t
+
+    Esto evita confundir ocupación observada con tasa de llegada.
+    """
+
+    if delta_t_min <= 0:
+        delta_t_min = DELTA_T_FALLBACK_MINUTOS
+
+    mu = 1.0 / TIEMPOS_SERVICIO[zona]
+    capacidad_actual = mu * cabinas_activas
+
+    atendidos_estimados = capacidad_actual * delta_t_min
+
+    llegadas_estimadas = (
+        personas_actual
+        - personas_anterior
+        + atendidos_estimados
+    )
+
+    # Protección: no permitimos llegadas negativas.
+    llegadas_estimadas = max(llegadas_estimadas, 0.0)
+
+    lambda_arr = llegadas_estimadas / delta_t_min
+
+    return {
+        "mu": mu,
+        "capacidad_actual": capacidad_actual,
+        "atendidos_estimados": atendidos_estimados,
+        "llegadas_estimadas": llegadas_estimadas,
+        "lambda_arr": lambda_arr,
+    }
+
+
+def estimar_lambda_fallback_desde_entrada(
+    zona: str,
+    lectura_anterior: dict,
+    lectura_actual: dict,
+    delta_t_min: float
+) -> float:
+    """
+    Fallback por si falta una columna de zona.
+
+    Usa la diferencia de la columna 'entrada' y reparte el flujo según ratios.
+    Solo se usa si no hay medición directa de la zona.
+    """
+
+    if "entrada" not in lectura_anterior or "entrada" not in lectura_actual:
+        return 0.0
+
+    entrada_prev = lectura_anterior.get("entrada", 0)
+    entrada_curr = lectura_actual.get("entrada", 0)
+
+    if delta_t_min <= 0:
+        delta_t_min = DELTA_T_FALLBACK_MINUTOS
+
+    # Para entrada no hay un puesto de servicio claro, así que estimamos llegada
+    # como diferencia positiva entre mediciones.
+    llegadas_entrada = max(entrada_curr - entrada_prev, 0.0)
+    lambda_entrada = llegadas_entrada / delta_t_min
+
+    if zona == "checkin":
+        return lambda_entrada * RATIO_ENTRADA["checkin"]
+
+    if zona == "bagdrop":
+        return lambda_entrada * RATIO_ENTRADA["bagdrop"]
+
+    if zona == "seguridad":
+        return lambda_entrada * (
+            RATIO_ENTRADA["checkin"]
+            + RATIO_ENTRADA["bagdrop"]
+            + RATIO_ENTRADA["directo_seguridad"]
+        )
+
+    if zona == "pasaportes":
+        return lambda_entrada * RATIO_CON_PASAPORTES
+
+    if zona == "embarque":
+        return lambda_entrada
+
+    return 0.0
+
+
+# ============================================================
+# ESPERA PARA PASAJERO NUEVO Y PREDICCIONES
+# ============================================================
+
+def calcular_espera_nuevo_pasajero(
+    personas_actuales: float,
+    mu: float,
+    cabinas_activas: int
+) -> float:
+    """
+    Estima cuánto esperaría alguien que entra ahora a esa cola.
+
+    Aproximación operativa:
+    - capacidad total = mu * cabinas
+    - hasta 'cabinas_activas' personas pueden estar siendo atendidas
+    - el resto se interpreta como cola visible
+
+    Devuelve espera en cola, no incluye servicio.
+    """
+
+    capacidad = mu * cabinas_activas
+
+    if capacidad <= 0:
+        return float("inf")
+
+    personas_esperando = max(personas_actuales - cabinas_activas, 0.0)
+
+    return personas_esperando / capacidad
+
+
+def calcular_tiempo_total_nuevo_pasajero(
+    personas_actuales: float,
+    mu: float,
+    cabinas_activas: int
+) -> float:
+    """
+    Espera en cola + tiempo medio de servicio.
+    """
+
+    espera = calcular_espera_nuevo_pasajero(
+        personas_actuales=personas_actuales,
+        mu=mu,
+        cabinas_activas=cabinas_activas,
+    )
+
+    if not math.isfinite(espera):
+        return float("inf")
+
+    return espera + (1.0 / mu)
+
+
+def predecir_personas_futuras(
+    personas_actuales: int,
+    lambda_arr: float,
+    mu: float,
+    cabinas_activas: int,
+    horizonte_min: float
+) -> float:
+    """
+    Predice ocupación futura mediante balance:
+
+        personas_futuras = personas_actuales + (lambda - capacidad) * horizonte
+
+    Si la capacidad supera las llegadas, la cola baja.
+    """
+
+    capacidad = mu * cabinas_activas
+
+    personas_futuras = (
+        personas_actuales
+        + (lambda_arr - capacidad) * horizonte_min
+    )
+
+    return max(personas_futuras, 0.0)
+
+
+def construir_predicciones(
+    personas_actuales: int,
+    lambda_arr: float,
+    mu: float,
+    cabinas_activas: int
+) -> dict:
+    """
+    Devuelve predicciones para 5, 10 y 15 minutos.
+    """
+
+    predicciones = {}
+
+    for h in HORIZONTES_PREDICCION:
+        personas_h = predecir_personas_futuras(
+            personas_actuales=personas_actuales,
+            lambda_arr=lambda_arr,
+            mu=mu,
+            cabinas_activas=cabinas_activas,
+            horizonte_min=h,
+        )
+
+        espera_h = calcular_espera_nuevo_pasajero(
+            personas_actuales=personas_h,
+            mu=mu,
+            cabinas_activas=cabinas_activas,
+        )
+
+        tiempo_total_h = calcular_tiempo_total_nuevo_pasajero(
+            personas_actuales=personas_h,
+            mu=mu,
+            cabinas_activas=cabinas_activas,
+        )
+
+        predicciones[h] = {
+            "personas": personas_h,
+            "espera_nuevo": espera_h,
+            "tiempo_total_nuevo": tiempo_total_h,
+        }
+
+    return predicciones
+
+
+# ============================================================
+# RECOMENDACIÓN DE CABINAS
+# ============================================================
+
+def recomendar_cabinas(
+    zona: str,
+    lambda_arr: float,
+    personas_actuales: int = 0
+) -> int:
+    """
+    Devuelve el mínimo número de cabinas necesario para que:
+    - el sistema sea estable,
+    - Wq <= umbral de apertura,
+    - y la espera para un pasajero nuevo sea razonable.
     """
 
     cfg = CABINAS_CONFIG[zona]
     mu = 1.0 / TIEMPOS_SERVICIO[zona]
 
-    if lambda_arr <= 0:
+    if lambda_arr <= 0 and personas_actuales <= 0:
         return cfg["min"]
 
     for c_test in range(cfg["min"], cfg["max"] + 1):
@@ -240,65 +621,158 @@ def recomendar_cabinas(zona: str, lambda_arr: float) -> int:
         if not metricas["estable"]:
             continue
 
-        if metricas["Wq"] <= UMBRALES["abrir"]:
+        espera_nuevo = calcular_espera_nuevo_pasajero(
+            personas_actuales=personas_actuales,
+            mu=mu,
+            cabinas_activas=c_test,
+        )
+
+        cumple_wq = metricas["Wq"] <= UMBRALES["abrir"]
+        cumple_espera_nuevo = espera_nuevo <= UMBRALES["abrir"]
+
+        if cumple_wq and cumple_espera_nuevo:
             return c_test
 
     return cfg["max"]
 
 
-def calcular_cola_mmc(zona: str, lambda_arr: float, c_actual: int) -> ResultadoCola:
+def calcular_cola_mmc(
+    zona: str,
+    personas_anterior: int,
+    personas_actual: int,
+    delta_t_min: float,
+    c_actual: int,
+    lambda_forzada: Optional[float] = None
+) -> ResultadoCola:
     """
-    Calcula las métricas M/M/c para una zona concreta usando las cabinas actuales.
+    Calcula métricas M/M/c para una zona usando balance temporal.
     """
 
-    mu = 1.0 / TIEMPOS_SERVICIO[zona]
+    estimacion = estimar_llegadas_por_balance(
+        zona=zona,
+        personas_anterior=personas_anterior,
+        personas_actual=personas_actual,
+        delta_t_min=delta_t_min,
+        cabinas_activas=c_actual,
+    )
+
+    mu = estimacion["mu"]
+    capacidad_actual = estimacion["capacidad_actual"]
+    atendidos_estimados = estimacion["atendidos_estimados"]
+    llegadas_estimadas = estimacion["llegadas_estimadas"]
+    lambda_arr = estimacion["lambda_arr"]
+
+    if lambda_forzada is not None:
+        lambda_arr = max(lambda_forzada, 0.0)
+        llegadas_estimadas = lambda_arr * delta_t_min
+
     metricas = calcular_metricas_mmc(lambda_arr, mu, c_actual)
-    c_rec = recomendar_cabinas(zona, lambda_arr)
+
+    espera_nuevo_actual = calcular_espera_nuevo_pasajero(
+        personas_actuales=personas_actual,
+        mu=mu,
+        cabinas_activas=c_actual,
+    )
+
+    tiempo_total_nuevo_actual = calcular_tiempo_total_nuevo_pasajero(
+        personas_actuales=personas_actual,
+        mu=mu,
+        cabinas_activas=c_actual,
+    )
+
+    predicciones = construir_predicciones(
+        personas_actuales=personas_actual,
+        lambda_arr=lambda_arr,
+        mu=mu,
+        cabinas_activas=c_actual,
+    )
+
+    c_rec = recomendar_cabinas(
+        zona=zona,
+        lambda_arr=lambda_arr,
+        personas_actuales=personas_actual,
+    )
 
     Wq = metricas["Wq"]
     rho = metricas["rho"]
 
+    pred_10 = predicciones.get(10, {})
+    espera_10 = pred_10.get("espera_nuevo", 0.0)
+    personas_10 = pred_10.get("personas", personas_actual)
+
     if not metricas["estable"]:
         accion = "CRITICO"
         mensaje = (
-            f"Sistema inestable: la demanda supera la capacidad actual. "
-            f"Abrir hasta {c_rec} cabina(s)."
+            f"Sistema inestable: llegan {lambda_arr:.2f} pax/min y la capacidad "
+            f"actual es {capacidad_actual:.2f} pax/min. Abrir hasta {c_rec} cabina(s)."
         )
-    elif Wq >= UMBRALES["critico"]:
+
+    elif espera_nuevo_actual >= UMBRALES["critico"] or espera_10 >= UMBRALES["critico"]:
         accion = "CRITICO"
         mensaje = (
-            f"Espera crítica: {Wq:.1f} min. "
+            f"Espera crítica. Ahora un pasajero nuevo esperaría "
+            f"{espera_nuevo_actual:.1f} min; en 10 min se estiman "
+            f"{personas_10:.0f} personas y {espera_10:.1f} min de espera. "
             f"Abrir hasta {c_rec} cabina(s)."
         )
+
     elif c_actual < c_rec:
         accion = "ABRIR"
         mensaje = (
             f"Abrir {c_rec - c_actual} cabina(s) más "
-            f"({c_actual} -> {c_rec}). Wq actual: {Wq:.1f} min."
+            f"({c_actual} -> {c_rec}). Espera de pasajero nuevo ahora: "
+            f"{espera_nuevo_actual:.1f} min."
         )
-    elif c_actual > c_rec and c_actual > CABINAS_CONFIG[zona]["min"] and Wq < UMBRALES["cerrar"]:
+
+    elif (
+        c_actual > c_rec
+        and c_actual > CABINAS_CONFIG[zona]["min"]
+        and Wq < UMBRALES["cerrar"]
+        and espera_nuevo_actual < UMBRALES["cerrar"]
+    ):
         accion = "CERRAR"
         mensaje = (
             f"Cerrar {c_actual - c_rec} cabina(s) "
-            f"({c_actual} -> {c_rec}). Wq actual: {Wq:.1f} min."
+            f"({c_actual} -> {c_rec}). Espera baja: "
+            f"{espera_nuevo_actual:.1f} min."
         )
+
     else:
         accion = "OK"
-        mensaje = f"Operación correcta con {c_actual} cabina(s). Wq: {Wq:.1f} min."
+        mensaje = (
+            f"Operación correcta con {c_actual} cabina(s). "
+            f"Espera de pasajero nuevo ahora: {espera_nuevo_actual:.1f} min."
+        )
 
     rho_mostrado = min(rho, 1.0) if math.isfinite(rho) else 1.0
 
     return ResultadoCola(
         zona=zona,
+
+        personas_anterior=personas_anterior,
+        personas_actual=personas_actual,
+        delta_t_min=delta_t_min,
+
+        atendidos_estimados=atendidos_estimados,
+        llegadas_estimadas=llegadas_estimadas,
+
         lambda_arr=lambda_arr,
         mu_servicio=mu,
+        capacidad_actual=capacidad_actual,
         c_activas=c_actual,
+
         rho=rho_mostrado,
         Lq=metricas["Lq"],
         Wq=metricas["Wq"],
         W=metricas["W"],
         P0=metricas["P0"],
         estable=metricas["estable"],
+
+        espera_nuevo_actual=espera_nuevo_actual,
+        tiempo_total_nuevo_actual=tiempo_total_nuevo_actual,
+
+        predicciones=predicciones,
+
         cabinas_recomendadas=c_rec,
         accion=accion,
         mensaje=mensaje,
@@ -309,47 +783,10 @@ def calcular_cola_mmc(zona: str, lambda_arr: float, c_actual: int) -> ResultadoC
 # LECTURA DEL CSV
 # ============================================================
 
-def leer_ultima_lectura_csv(csv_path: str) -> Optional[dict]:
-    """
-    Lee la última fila del CSV.
-
-    Columnas recomendadas:
-        timestamp,
-        entrada,
-        checkin,
-        bagdrop,
-        directo_seguridad,
-        seguridad,
-        con_pasaportes,
-        sin_pasaportes,
-        pasaportes,
-        embarque
-
-    No es obligatorio que estén todas.
-    """
-
-    if not os.path.exists(csv_path):
-        print(f"[ERROR] No se encontró el CSV: {csv_path}")
-        return None
-
-    ultima = None
-
-    try:
-        with open(csv_path, newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                ultima = row
-    except PermissionError:
-        print("[ERROR] No se pudo leer el CSV. Puede estar abierto en otro programa.")
-        return None
-
-    if ultima is None:
-        print("[ERROR] CSV vacío.")
-        return None
-
+def normalizar_fila_csv(row: dict) -> dict:
     resultado = {}
 
-    for k, v in ultima.items():
+    for k, v in row.items():
         if k is None:
             continue
 
@@ -359,144 +796,248 @@ def leer_ultima_lectura_csv(csv_path: str) -> Optional[dict]:
             resultado[k] = v
             continue
 
-        try:
-            resultado[k] = int(float(v)) if v not in ("", "None", "null", None) else 0
-        except ValueError:
-            resultado[k] = 0
+        resultado[k] = limpiar_entero(v)
 
     return resultado
 
 
-def personas_a_lambda(personas: int, ventana_minutos: float = VENTANA_ESTIMACION_MINUTOS) -> float:
+def leer_todas_lecturas_csv(csv_path: str) -> list[dict]:
+    if not os.path.exists(csv_path):
+        print(f"[ERROR] No se encontró el CSV: {csv_path}")
+        return []
+
+    filas = []
+
+    try:
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+
+            for row in reader:
+                filas.append(normalizar_fila_csv(row))
+
+    except PermissionError:
+        print("[ERROR] No se pudo leer el CSV. Puede estar abierto en otro programa.")
+        return []
+
+    return filas
+
+
+def leer_ultima_lectura_csv(csv_path: str) -> Optional[dict]:
+    filas = leer_todas_lecturas_csv(csv_path)
+
+    if not filas:
+        print("[ERROR] CSV vacío.")
+        return None
+
+    return filas[-1]
+
+
+def leer_dos_ultimas_lecturas_csv(csv_path: str):
     """
-    Convierte una ocupación observada en una tasa aproximada de llegada.
+    Devuelve:
+        lectura_anterior, lectura_actual
 
-    Importante:
-    Esto es una aproximación para la demo. En un sistema real se debería estimar lambda
-    con tracking de entradas/salidas o comparando lecturas temporales.
+    Si solo hay una fila, usa esa misma como anterior y actual.
+    En ese caso el balance todavía no es perfecto, pero evita que el sistema falle.
     """
 
-    if ventana_minutos <= 0:
-        return 0.0
+    filas = leer_todas_lecturas_csv(csv_path)
 
-    return max(personas, 0) / ventana_minutos
+    if not filas:
+        print("[ERROR] CSV vacío.")
+        return None, None
 
+    if len(filas) == 1:
+        return filas[0], filas[0]
 
-# ============================================================
-# FLUJOS ENLAZADOS DEL AEROPUERTO
-# ============================================================
-
-def construir_lambdas_enlazadas(lectura: dict) -> dict:
-    """
-    Construye las tasas de llegada de cada cola siguiendo la arquitectura del aeropuerto.
-
-    Si existe columna 'entrada':
-        entrada se reparte entre checkin, bagdrop y directo_seguridad.
-
-    Si no existe:
-        usa las columnas detectadas directamente por zona.
-
-    Después:
-        seguridad recibe flujo aproximado de checkin + bagdrop + directo_seguridad.
-        pasaportes recibe un porcentaje del flujo de seguridad.
-        embarque recibe flujo sin pasaportes + flujo con pasaportes.
-    """
-
-    lambdas = {}
-
-    hay_entrada = "entrada" in lectura and lectura.get("entrada", 0) > 0
-
-    if hay_entrada:
-        lambda_entrada = personas_a_lambda(lectura.get("entrada", 0))
-
-        lambdas["checkin"] = lambda_entrada * RATIO_ENTRADA["checkin"]
-        lambdas["bagdrop"] = lambda_entrada * RATIO_ENTRADA["bagdrop"]
-        lambda_directo_seguridad = lambda_entrada * RATIO_ENTRADA["directo_seguridad"]
-
-    else:
-        lambdas["checkin"] = personas_a_lambda(lectura.get("checkin", 0))
-        lambdas["bagdrop"] = personas_a_lambda(lectura.get("bagdrop", 0))
-        lambda_directo_seguridad = personas_a_lambda(lectura.get("directo_seguridad", 0))
-
-    lambda_seguridad_estimado = (
-        lambdas["checkin"]
-        + lambdas["bagdrop"]
-        + lambda_directo_seguridad
-    )
-
-    if "seguridad" in lectura and lectura.get("seguridad", 0) > 0:
-        lambda_seguridad_observado = personas_a_lambda(lectura.get("seguridad", 0))
-        lambdas["seguridad"] = 0.5 * lambda_seguridad_estimado + 0.5 * lambda_seguridad_observado
-    else:
-        lambdas["seguridad"] = lambda_seguridad_estimado
-
-    lambda_con_pasaportes_estimado = lambdas["seguridad"] * RATIO_CON_PASAPORTES
-    lambda_sin_pasaportes_estimado = lambdas["seguridad"] * RATIO_SIN_PASAPORTES
-
-    if "con_pasaportes" in lectura and lectura.get("con_pasaportes", 0) > 0:
-        lambda_con_pasaportes_observado = personas_a_lambda(lectura.get("con_pasaportes", 0))
-        lambda_con_pasaportes = 0.5 * lambda_con_pasaportes_estimado + 0.5 * lambda_con_pasaportes_observado
-    else:
-        lambda_con_pasaportes = lambda_con_pasaportes_estimado
-
-    if "sin_pasaportes" in lectura and lectura.get("sin_pasaportes", 0) > 0:
-        lambda_sin_pasaportes_observado = personas_a_lambda(lectura.get("sin_pasaportes", 0))
-        lambda_sin_pasaportes = 0.5 * lambda_sin_pasaportes_estimado + 0.5 * lambda_sin_pasaportes_observado
-    else:
-        lambda_sin_pasaportes = lambda_sin_pasaportes_estimado
-
-    if "pasaportes" in lectura and lectura.get("pasaportes", 0) > 0:
-        lambda_pasaportes_observado = personas_a_lambda(lectura.get("pasaportes", 0))
-        lambdas["pasaportes"] = 0.5 * lambda_con_pasaportes + 0.5 * lambda_pasaportes_observado
-    else:
-        lambdas["pasaportes"] = lambda_con_pasaportes
-
-    lambda_embarque_estimado = lambda_sin_pasaportes + lambdas["pasaportes"]
-
-    if "embarque" in lectura and lectura.get("embarque", 0) > 0:
-        lambda_embarque_observado = personas_a_lambda(lectura.get("embarque", 0))
-        lambdas["embarque"] = 0.5 * lambda_embarque_estimado + 0.5 * lambda_embarque_observado
-    else:
-        lambdas["embarque"] = lambda_embarque_estimado
-
-    return lambdas
+    return filas[-2], filas[-1]
 
 
 # ============================================================
 # MOTOR PRINCIPAL
 # ============================================================
 
-def ejecutar_analisis(lectura: dict, estado: EstadoSistema) -> list[ResultadoCola]:
+def ejecutar_analisis(
+    lectura_anterior: dict,
+    lectura_actual: dict,
+    estado: EstadoSistema
+) -> list[ResultadoCola]:
     """
     Ejecuta el análisis completo:
-    1. Construye lambdas enlazadas.
-    2. Calcula cada cola.
-    3. Actualiza cabinas recomendadas.
+
+    1. Lee dos mediciones consecutivas.
+    2. Calcula delta_t.
+    3. Para cada zona:
+       - estima llegadas por balance,
+       - calcula M/M/c,
+       - calcula espera de pasajero nuevo,
+       - predice 5/10/15 min,
+       - recomienda cabinas.
+    4. Actualiza estado de cabinas al final.
     """
 
-    lambdas = construir_lambdas_enlazadas(lectura)
     resultados = []
+    delta_t_min = calcular_delta_t_min(lectura_anterior, lectura_actual)
 
-    orden_zonas = [
-        "checkin",
-        "bagdrop",
-        "seguridad",
-        "pasaportes",
-        "embarque",
-    ]
-
-    for zona in orden_zonas:
-        lambda_zona = lambdas.get(zona, 0.0)
+    for zona in ZONAS_MODELO:
+        personas_anterior = lectura_anterior.get(zona, 0)
+        personas_actual = lectura_actual.get(zona, 0)
         c_actual = estado.cabinas[zona]
 
-        resultado = calcular_cola_mmc(zona, lambda_zona, c_actual)
+        lambda_forzada = None
+
+        # Si la zona no existe en el CSV, usamos fallback desde entrada.
+        if zona not in lectura_actual or zona not in lectura_anterior:
+            lambda_forzada = estimar_lambda_fallback_desde_entrada(
+                zona=zona,
+                lectura_anterior=lectura_anterior,
+                lectura_actual=lectura_actual,
+                delta_t_min=delta_t_min,
+            )
+
+        resultado = calcular_cola_mmc(
+            zona=zona,
+            personas_anterior=personas_anterior,
+            personas_actual=personas_actual,
+            delta_t_min=delta_t_min,
+            c_actual=c_actual,
+            lambda_forzada=lambda_forzada,
+        )
+
         resultados.append(resultado)
 
-    # Actualizamos al final para que todos los cálculos usen el mismo estado inicial.
+    # Actualizamos cabinas al final para que todo el análisis use el mismo estado inicial.
     for r in resultados:
         estado.actualizar(r.zona, r.cabinas_recomendadas)
 
     return resultados
+
+
+# ============================================================
+# EXPERIENCIA DEL PASAJERO
+# ============================================================
+
+def resultados_por_zona(resultados: list[ResultadoCola]) -> dict:
+    return {r.zona: r for r in resultados}
+
+
+def sumar_tiempo_total_zonas(mapa: dict, zonas: list[str]) -> float:
+    total = 0.0
+
+    for zona in zonas:
+        r = mapa.get(zona)
+
+        if r is None:
+            continue
+
+        if not math.isfinite(r.tiempo_total_nuevo_actual):
+            return float("inf")
+
+        total += r.tiempo_total_nuevo_actual
+
+    return total
+
+
+def calcular_experiencia_pasajero(resultados: list[ResultadoCola]) -> dict:
+    """
+    Calcula tiempos estimados desde entrada según ruta de pasajero.
+
+    Esto sirve para el dashboard:
+    - pasajero con check-in y pasaportes,
+    - pasajero con bag drop,
+    - pasajero directo a seguridad,
+    etc.
+    """
+
+    mapa = resultados_por_zona(resultados)
+
+    rutas = {
+        "checkin_seguridad_pasaportes_embarque": [
+            "checkin",
+            "seguridad",
+            "pasaportes",
+            "embarque",
+        ],
+        "checkin_seguridad_embarque": [
+            "checkin",
+            "seguridad",
+            "embarque",
+        ],
+        "bagdrop_seguridad_pasaportes_embarque": [
+            "bagdrop",
+            "seguridad",
+            "pasaportes",
+            "embarque",
+        ],
+        "bagdrop_seguridad_embarque": [
+            "bagdrop",
+            "seguridad",
+            "embarque",
+        ],
+        "directo_seguridad_pasaportes_embarque": [
+            "seguridad",
+            "pasaportes",
+            "embarque",
+        ],
+        "directo_seguridad_embarque": [
+            "seguridad",
+            "embarque",
+        ],
+    }
+
+    experiencia = {}
+
+    for nombre, zonas in rutas.items():
+        experiencia[nombre] = sumar_tiempo_total_zonas(mapa, zonas)
+
+    return experiencia
+
+
+def guardar_experiencia_pasajero_csv(
+    resultados: list[ResultadoCola],
+    output_path: str,
+    timestamp_lectura: str = ""
+):
+    """
+    Guarda un CSV adicional con tiempos estimados de rutas completas.
+
+    Archivo:
+        outputs/experiencia_pasajero.csv
+    """
+
+    output_experiencia = os.path.join(
+        os.path.dirname(output_path),
+        "experiencia_pasajero.csv"
+    )
+
+    os.makedirs(os.path.dirname(output_experiencia), exist_ok=True)
+
+    campos = [
+        "timestamp_procesado",
+        "timestamp_lectura_csv",
+        "ruta_pasajero",
+        "tiempo_total_estimado_desde_entrada_min",
+    ]
+
+    es_nuevo = not os.path.exists(output_experiencia)
+
+    experiencia = calcular_experiencia_pasajero(resultados)
+
+    with open(output_experiencia, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=campos)
+
+        if es_nuevo:
+            writer.writeheader()
+
+        timestamp_procesado = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        for ruta, tiempo in experiencia.items():
+            writer.writerow({
+                "timestamp_procesado": timestamp_procesado,
+                "timestamp_lectura_csv": timestamp_lectura,
+                "ruta_pasajero": ruta,
+                "tiempo_total_estimado_desde_entrada_min": redondear_csv(tiempo),
+            })
 
 
 # ============================================================
@@ -512,14 +1053,12 @@ COLORES = {
 }
 
 
-def formato_float(valor: float, decimales: int = 1) -> str:
-    if valor == float("inf") or not math.isfinite(valor):
-        return "inf"
-    return f"{valor:.{decimales}f}"
-
-
-def imprimir_informe(resultados: list[ResultadoCola], estado: EstadoSistema, timestamp: str = ""):
-    ancho = 78
+def imprimir_informe(
+    resultados: list[ResultadoCola],
+    estado: EstadoSistema,
+    timestamp: str = ""
+):
+    ancho = 96
 
     print("\n" + "=" * ancho)
     print("  SISTEMA DE GESTIÓN DE COLAS - AEROPUERTO")
@@ -531,27 +1070,64 @@ def imprimir_informe(resultados: list[ResultadoCola], estado: EstadoSistema, tim
         color = COLORES.get(r.accion, "")
         reset = COLORES["RESET"]
 
+        pred_5 = r.predicciones.get(5, {})
+        pred_10 = r.predicciones.get(10, {})
+        pred_15 = r.predicciones.get(15, {})
+
         print(f"\n  ZONA: {r.zona.upper()}")
-        print(f"  {'-' * 50}")
-        print(f"  Llegadas lambda:     {r.lambda_arr:.2f} personas/min")
-        print(f"  Servicio mu:         {r.mu_servicio:.2f} personas/min/cabina")
-        print(f"  Cabinas activas c:   {r.c_activas}")
-        print(f"  Utilizacion rho:     {r.rho:.1%}")
-        print(f"  Cola media Lq:       {formato_float(r.Lq)} personas")
-        print(f"  Espera media Wq:     {formato_float(r.Wq)} min")
-        print(f"  Tiempo sistema W:    {formato_float(r.W)} min")
-        print(f"  Estabilidad:         {'estable' if r.estable else 'inestable'}")
-        print(f"  Recomendadas:        {r.cabinas_recomendadas}")
+        print(f"  {'-' * 72}")
+        print(f"  Personas medición anterior:       {r.personas_anterior}")
+        print(f"  Personas medición actual:         {r.personas_actual}")
+        print(f"  Tiempo entre mediciones:          {r.delta_t_min:.2f} min")
+        print(f"  Personas atendidas estimadas:     {r.atendidos_estimados:.2f}")
+        print(f"  Personas llegadas estimadas:      {r.llegadas_estimadas:.2f}")
+        print(f"  Tasa llegada estimada lambda:     {r.lambda_arr:.2f} personas/min")
+        print(f"  Capacidad actual:                 {r.capacidad_actual:.2f} personas/min")
+        print(f"  Servicio mu:                      {r.mu_servicio:.2f} personas/min/cabina")
+        print(f"  Cabinas activas:                  {r.c_activas}")
+        print(f"  Utilización rho:                  {r.rho:.1%}")
+        print(f"  Cola media modelo Lq:             {formato_float(r.Lq)} personas")
+        print(f"  Espera media cola modelo Wq:      {formato_float(r.Wq)} min")
+        print(f"  Tiempo total medio modelo W:      {formato_float(r.W)} min")
+        print(f"  Espera pasajero nuevo ahora:      {formato_float(r.espera_nuevo_actual)} min")
+        print(f"  Total pasajero nuevo ahora:       {formato_float(r.tiempo_total_nuevo_actual)} min")
+
+        print("  Predicciones:")
+        print(
+            f"    +5 min:  {pred_5.get('personas', 0):.0f} personas, "
+            f"espera nuevo {formato_float(pred_5.get('espera_nuevo', 0))} min, "
+            f"total {formato_float(pred_5.get('tiempo_total_nuevo', 0))} min"
+        )
+        print(
+            f"    +10 min: {pred_10.get('personas', 0):.0f} personas, "
+            f"espera nuevo {formato_float(pred_10.get('espera_nuevo', 0))} min, "
+            f"total {formato_float(pred_10.get('tiempo_total_nuevo', 0))} min"
+        )
+        print(
+            f"    +15 min: {pred_15.get('personas', 0):.0f} personas, "
+            f"espera nuevo {formato_float(pred_15.get('espera_nuevo', 0))} min, "
+            f"total {formato_float(pred_15.get('tiempo_total_nuevo', 0))} min"
+        )
+
+        print(f"  Estabilidad:                      {'estable' if r.estable else 'inestable'}")
+        print(f"  Cabinas recomendadas:             {r.cabinas_recomendadas}")
         print(f"  {color}> {r.mensaje}{reset}")
+
+    experiencia = calcular_experiencia_pasajero(resultados)
+
+    print("\n" + "=" * ancho)
+    print("  TIEMPO ESTIMADO PARA ALGUIEN QUE ENTRA NUEVO")
+    print("  " + "-" * 72)
+
+    for ruta, tiempo_total in experiencia.items():
+        print(f"  {ruta:<50} {formato_float(tiempo_total)} min")
 
     print("\n" + "=" * ancho)
     print("  ESTADO ACTUALIZADO DE CABINAS")
-    print("  " + "-" * 50)
+    print("  " + "-" * 72)
 
     for zona, n in estado.cabinas.items():
         cfg = CABINAS_CONFIG[zona]
-
-        # Uso caracteres simples para que no se vea raro en la terminal.
         barra = "#" * n + "-" * (cfg["max"] - n)
 
         print(f"  {zona:<12} [{barra}] {n}/{cfg['max']}")
@@ -561,29 +1137,64 @@ def imprimir_informe(resultados: list[ResultadoCola], estado: EstadoSistema, tim
 
 def guardar_informe_csv(
     resultados: list[ResultadoCola],
-    output_path: str = OUTPUT_INFORME_DEFAULT
+    output_path: str = OUTPUT_INFORME_DEFAULT,
+    timestamp_lectura: str = ""
 ):
     """
-    Guarda los resultados en CSV para trazabilidad y futuro dashboard.
+    Guarda los resultados en CSV para el dashboard.
+
+    El CSV tiene una fila por zona y por medición procesada.
+    Los nombres de columnas son explicativos para que se entiendan directamente
+    desde pandas, Excel o Streamlit.
     """
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    es_nuevo = not os.path.exists(output_path)
 
     campos = [
-        "timestamp",
-        "zona",
-        "lambda_arr",
-        "mu_servicio",
-        "c_activas",
-        "rho",
-        "Lq",
-        "Wq",
-        "W",
-        "estable",
+        "timestamp_procesado",
+        "timestamp_lectura_csv",
+        "zona_aeropuerto",
+
+        "personas_medicion_anterior",
+        "personas_medicion_actual",
+        "minutos_entre_mediciones",
+
+        "personas_atendidas_estimadas_intervalo",
+        "personas_llegadas_estimadas_intervalo",
+        "tasa_llegada_estimada_personas_min",
+
+        "tiempo_servicio_medio_min_por_persona",
+        "tasa_servicio_personas_min_por_cabina",
+        "capacidad_total_actual_personas_min",
+        "cabinas_activas_actuales",
+
+        "utilizacion_puesto_porcentaje",
+        "cola_media_modelo_personas",
+        "espera_media_cola_modelo_min",
+        "tiempo_total_medio_modelo_min",
+        "sistema_estable",
+
+        "espera_estimada_pasajero_nuevo_ahora_min",
+        "tiempo_total_estimado_pasajero_nuevo_ahora_min",
+
+        "personas_predichas_en_5_min",
+        "espera_pasajero_nuevo_predicha_en_5_min",
+        "tiempo_total_pasajero_nuevo_predicho_en_5_min",
+
+        "personas_predichas_en_10_min",
+        "espera_pasajero_nuevo_predicha_en_10_min",
+        "tiempo_total_pasajero_nuevo_predicho_en_10_min",
+
+        "personas_predichas_en_15_min",
+        "espera_pasajero_nuevo_predicha_en_15_min",
+        "tiempo_total_pasajero_nuevo_predicho_en_15_min",
+
         "cabinas_recomendadas",
-        "accion",
+        "accion_recomendada",
+        "mensaje_recomendacion",
     ]
+
+    es_nuevo = not os.path.exists(output_path)
 
     with open(output_path, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=campos)
@@ -591,23 +1202,62 @@ def guardar_informe_csv(
         if es_nuevo:
             writer.writeheader()
 
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        timestamp_procesado = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         for r in resultados:
+            pred_5 = r.predicciones.get(5, {})
+            pred_10 = r.predicciones.get(10, {})
+            pred_15 = r.predicciones.get(15, {})
+
             writer.writerow({
-                "timestamp": ts,
-                "zona": r.zona,
-                "lambda_arr": round(r.lambda_arr, 3),
-                "mu_servicio": round(r.mu_servicio, 3),
-                "c_activas": r.c_activas,
-                "rho": round(r.rho, 3),
-                "Lq": round(r.Lq, 2) if math.isfinite(r.Lq) else "inf",
-                "Wq": round(r.Wq, 2) if math.isfinite(r.Wq) else "inf",
-                "W": round(r.W, 2) if math.isfinite(r.W) else "inf",
-                "estable": r.estable,
+                "timestamp_procesado": timestamp_procesado,
+                "timestamp_lectura_csv": timestamp_lectura,
+                "zona_aeropuerto": r.zona,
+
+                "personas_medicion_anterior": r.personas_anterior,
+                "personas_medicion_actual": r.personas_actual,
+                "minutos_entre_mediciones": redondear_csv(r.delta_t_min),
+
+                "personas_atendidas_estimadas_intervalo": redondear_csv(r.atendidos_estimados),
+                "personas_llegadas_estimadas_intervalo": redondear_csv(r.llegadas_estimadas),
+                "tasa_llegada_estimada_personas_min": redondear_csv(r.lambda_arr),
+
+                "tiempo_servicio_medio_min_por_persona": redondear_csv(1.0 / r.mu_servicio),
+                "tasa_servicio_personas_min_por_cabina": redondear_csv(r.mu_servicio),
+                "capacidad_total_actual_personas_min": redondear_csv(r.capacidad_actual),
+                "cabinas_activas_actuales": r.c_activas,
+
+                "utilizacion_puesto_porcentaje": redondear_csv(r.rho * 100),
+                "cola_media_modelo_personas": redondear_csv(r.Lq),
+                "espera_media_cola_modelo_min": redondear_csv(r.Wq),
+                "tiempo_total_medio_modelo_min": redondear_csv(r.W),
+                "sistema_estable": r.estable,
+
+                "espera_estimada_pasajero_nuevo_ahora_min": redondear_csv(r.espera_nuevo_actual),
+                "tiempo_total_estimado_pasajero_nuevo_ahora_min": redondear_csv(r.tiempo_total_nuevo_actual),
+
+                "personas_predichas_en_5_min": redondear_csv(pred_5.get("personas", 0)),
+                "espera_pasajero_nuevo_predicha_en_5_min": redondear_csv(pred_5.get("espera_nuevo", 0)),
+                "tiempo_total_pasajero_nuevo_predicho_en_5_min": redondear_csv(pred_5.get("tiempo_total_nuevo", 0)),
+
+                "personas_predichas_en_10_min": redondear_csv(pred_10.get("personas", 0)),
+                "espera_pasajero_nuevo_predicha_en_10_min": redondear_csv(pred_10.get("espera_nuevo", 0)),
+                "tiempo_total_pasajero_nuevo_predicho_en_10_min": redondear_csv(pred_10.get("tiempo_total_nuevo", 0)),
+
+                "personas_predichas_en_15_min": redondear_csv(pred_15.get("personas", 0)),
+                "espera_pasajero_nuevo_predicha_en_15_min": redondear_csv(pred_15.get("espera_nuevo", 0)),
+                "tiempo_total_pasajero_nuevo_predicho_en_15_min": redondear_csv(pred_15.get("tiempo_total_nuevo", 0)),
+
                 "cabinas_recomendadas": r.cabinas_recomendadas,
-                "accion": r.accion,
+                "accion_recomendada": r.accion,
+                "mensaje_recomendacion": r.mensaje,
             })
+
+    guardar_experiencia_pasajero_csv(
+        resultados=resultados,
+        output_path=output_path,
+        timestamp_lectura=timestamp_lectura,
+    )
 
 
 # ============================================================
@@ -616,9 +1266,9 @@ def guardar_informe_csv(
 
 ESCENARIOS_DEMO = [
     {
-        "descripcion": "Mañana tranquila",
+        "descripcion": "Mañana tranquila - medición 1",
         "lectura": {
-            "timestamp": "07:00",
+            "timestamp": "2026-05-15 07:00:00",
             "entrada": 12,
             "checkin": 8,
             "bagdrop": 5,
@@ -631,48 +1281,63 @@ ESCENARIOS_DEMO = [
         },
     },
     {
-        "descripcion": "Hora punta",
+        "descripcion": "Mañana tranquila - medición 2",
         "lectura": {
-            "timestamp": "09:30",
-            "entrada": 55,
-            "checkin": 42,
-            "bagdrop": 30,
-            "directo_seguridad": 20,
-            "seguridad": 52,
-            "con_pasaportes": 24,
-            "sin_pasaportes": 28,
-            "pasaportes": 25,
-            "embarque": 38,
+            "timestamp": "2026-05-15 07:01:00",
+            "entrada": 15,
+            "checkin": 9,
+            "bagdrop": 6,
+            "directo_seguridad": 5,
+            "seguridad": 9,
+            "con_pasaportes": 4,
+            "sin_pasaportes": 5,
+            "pasaportes": 5,
+            "embarque": 6,
         },
     },
     {
-        "descripcion": "Saturación crítica",
+        "descripcion": "Hora punta - medición 3",
         "lectura": {
-            "timestamp": "10:15",
-            "entrada": 90,
-            "checkin": 80,
-            "bagdrop": 55,
-            "directo_seguridad": 35,
-            "seguridad": 95,
-            "con_pasaportes": 45,
-            "sin_pasaportes": 50,
-            "pasaportes": 48,
-            "embarque": 70,
+            "timestamp": "2026-05-15 07:02:00",
+            "entrada": 40,
+            "checkin": 26,
+            "bagdrop": 18,
+            "directo_seguridad": 14,
+            "seguridad": 35,
+            "con_pasaportes": 16,
+            "sin_pasaportes": 19,
+            "pasaportes": 18,
+            "embarque": 24,
         },
     },
     {
-        "descripcion": "Vuelta a la normalidad",
+        "descripcion": "Saturación crítica - medición 4",
         "lectura": {
-            "timestamp": "13:00",
-            "entrada": 25,
-            "checkin": 15,
-            "bagdrop": 10,
-            "directo_seguridad": 8,
-            "seguridad": 18,
-            "con_pasaportes": 8,
-            "sin_pasaportes": 10,
-            "pasaportes": 7,
-            "embarque": 12,
+            "timestamp": "2026-05-15 07:03:00",
+            "entrada": 75,
+            "checkin": 58,
+            "bagdrop": 40,
+            "directo_seguridad": 25,
+            "seguridad": 70,
+            "con_pasaportes": 32,
+            "sin_pasaportes": 38,
+            "pasaportes": 36,
+            "embarque": 52,
+        },
+    },
+    {
+        "descripcion": "Mejora tras refuerzo - medición 5",
+        "lectura": {
+            "timestamp": "2026-05-15 07:04:00",
+            "entrada": 50,
+            "checkin": 45,
+            "bagdrop": 31,
+            "directo_seguridad": 18,
+            "seguridad": 55,
+            "con_pasaportes": 25,
+            "sin_pasaportes": 30,
+            "pasaportes": 28,
+            "embarque": 42,
         },
     },
 ]
@@ -680,18 +1345,39 @@ ESCENARIOS_DEMO = [
 
 def modo_demo():
     print("\nMODO DEMO - Simulación interna de escenarios\n")
+
     estado = EstadoSistema()
 
-    for escenario in ESCENARIOS_DEMO:
-        print(f"\nEscenario: {escenario['descripcion']}")
-        resultados = ejecutar_analisis(escenario["lectura"], estado)
-        imprimir_informe(resultados, estado, escenario["lectura"]["timestamp"])
+    for i in range(1, len(ESCENARIOS_DEMO)):
+        anterior = ESCENARIOS_DEMO[i - 1]
+        actual = ESCENARIOS_DEMO[i]
+
+        print(f"\nEscenario: {actual['descripcion']}")
+
+        resultados = ejecutar_analisis(
+            lectura_anterior=anterior["lectura"],
+            lectura_actual=actual["lectura"],
+            estado=estado,
+        )
+
+        imprimir_informe(
+            resultados=resultados,
+            estado=estado,
+            timestamp=actual["lectura"]["timestamp"],
+        )
+
+        guardar_informe_csv(
+            resultados=resultados,
+            output_path=OUTPUT_INFORME_DEFAULT,
+            timestamp_lectura=actual["lectura"]["timestamp"],
+        )
+
         input("Pulsa Enter para continuar...")
 
 
 def modo_watch(csv_path: str, output_csv: str):
     """
-    Lee continuamente la última fila del CSV.
+    Lee continuamente las dos últimas filas del CSV.
     Ideal para conectar con el simulador o con YOLO.
     """
 
@@ -706,17 +1392,31 @@ def modo_watch(csv_path: str, output_csv: str):
 
     try:
         while True:
-            lectura = leer_ultima_lectura_csv(csv_path)
+            lectura_anterior, lectura_actual = leer_dos_ultimas_lecturas_csv(csv_path)
 
-            if lectura is not None:
-                timestamp = lectura.get("timestamp", "")
+            if lectura_anterior is not None and lectura_actual is not None:
+                timestamp = lectura_actual.get("timestamp", "")
 
                 if timestamp != ultimo_timestamp_procesado:
                     ultimo_timestamp_procesado = timestamp
 
-                    resultados = ejecutar_analisis(lectura, estado)
-                    imprimir_informe(resultados, estado, timestamp)
-                    guardar_informe_csv(resultados, output_csv)
+                    resultados = ejecutar_analisis(
+                        lectura_anterior=lectura_anterior,
+                        lectura_actual=lectura_actual,
+                        estado=estado,
+                    )
+
+                    imprimir_informe(
+                        resultados=resultados,
+                        estado=estado,
+                        timestamp=timestamp,
+                    )
+
+                    guardar_informe_csv(
+                        resultados=resultados,
+                        output_path=output_csv,
+                        timestamp_lectura=timestamp,
+                    )
 
             time.sleep(INTERVALO_WATCH_SEGUNDOS)
 
@@ -770,18 +1470,35 @@ def main():
         return
 
     estado = EstadoSistema()
-    lectura = leer_ultima_lectura_csv(args.csv)
 
-    if lectura is None:
+    lectura_anterior, lectura_actual = leer_dos_ultimas_lecturas_csv(args.csv)
+
+    if lectura_anterior is None or lectura_actual is None:
         return
 
-    print(f"\nLectura cargada: {lectura}")
+    print(f"\nLectura anterior cargada: {lectura_anterior}")
+    print(f"Lectura actual cargada:   {lectura_actual}")
 
-    resultados = ejecutar_analisis(lectura, estado)
-    imprimir_informe(resultados, estado, lectura.get("timestamp", ""))
-    guardar_informe_csv(resultados, args.output_csv)
+    resultados = ejecutar_analisis(
+        lectura_anterior=lectura_anterior,
+        lectura_actual=lectura_actual,
+        estado=estado,
+    )
 
-    print(f"Informe guardado en: {args.output_csv}")
+    imprimir_informe(
+        resultados=resultados,
+        estado=estado,
+        timestamp=lectura_actual.get("timestamp", ""),
+    )
+
+    guardar_informe_csv(
+        resultados=resultados,
+        output_path=args.output_csv,
+        timestamp_lectura=lectura_actual.get("timestamp", ""),
+    )
+
+    print(f"Informe de colas guardado en: {args.output_csv}")
+    print(f"Experiencia de pasajero guardada en: {os.path.join(os.path.dirname(args.output_csv), 'experiencia_pasajero.csv')}")
 
 
 if __name__ == "__main__":

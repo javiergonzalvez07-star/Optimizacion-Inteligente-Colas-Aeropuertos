@@ -2,57 +2,81 @@
 simulador_lecturas_aeropuerto.py
 ================================
 
-Generador sintético de lecturas para el sistema de colas del aeropuerto.
+Generador sintetico de lecturas para el sistema de colas del aeropuerto.
 
-Este script simula lo que normalmente produciría el sistema YOLO:
-un CSV con una fila por lectura y columnas por zona.
+El nuevo queue_engine estima lambda por balance temporal:
 
-IMPORTANTE:
-Este archivo está dentro de la carpeta /colas.
-Por eso el CSV se guarda una carpeta por encima, en:
+    cola_actual = cola_anterior + llegadas - atendidos
 
-    ../outputs/lecturas_aeropuerto.csv
+Por eso este simulador no genera cada zona como un numero aleatorio
+independiente. Mantiene un estado interno de colas y lo actualiza en cada
+lectura con:
+- llegadas nuevas al aeropuerto,
+- reparto hacia check-in, bag drop y seguridad,
+- capacidad de servicio por zona,
+- avance hacia seguridad, pasaportes y embarque.
 
-Estructura esperada:
-
-aeropuerto_yolo/
-├── outputs/
-│   └── lecturas_aeropuerto.csv
-└── colas/
-    └── simulador_lecturas_aeropuerto.py
+CSV generado:
+    outputs/lecturas_aeropuerto.csv
 
 Uso:
     python colas/simulador_lecturas_aeropuerto.py
 
-Mientras este script está funcionando, en otra terminal puedes ejecutar:
+Mientras este script funciona, en otra terminal:
     python colas/queue_engine.py --watch
 """
 
 import csv
 import os
-import time
 import random
-from datetime import datetime
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 
 
 # ============================================================
 # RUTAS
 # ============================================================
 
-# __file__ está dentro de /colas.
-# dirname(__file__) = .../aeropuerto_yolo/colas
-# dirname(dirname(__file__)) = .../aeropuerto_yolo
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
 OUTPUT_PATH = os.path.join(OUTPUT_DIR, "lecturas_aeropuerto.csv")
 
+
+# ============================================================
+# CONFIGURACION
+# ============================================================
+
+# Tiempo real entre filas escritas. Se mantiene corto para la demo/watch.
 INTERVALO_SEGUNDOS = 3
 
+# Tiempo simulado entre dos mediciones. El queue_engine lee este delta desde
+# timestamp, asi que una lectura equivale a un minuto operativo.
+MINUTOS_SIMULADOS_POR_LECTURA = 1.0
 
-# ============================================================
-# COLUMNAS DEL CSV
-# ============================================================
+RATIO_CHECKIN = 0.35
+RATIO_BAGDROP = 0.25
+RATIO_DIRECTO_SEGURIDAD = 0.40
+RATIO_CON_PASAPORTES = 0.45
+
+TIEMPOS_SERVICIO = {
+    "checkin": 3.5,
+    "bagdrop": 2.0,
+    "seguridad": 1.2,
+    "pasaportes": 2.0,
+    "embarque": 0.5,
+}
+
+# Cabinas usadas por el simulador para mover personas entre zonas. No intenta
+# copiar el estado interno del queue_engine; solo produce una realidad coherente.
+CABINAS_SIMULADAS = {
+    "checkin": 4,
+    "bagdrop": 2,
+    "seguridad": 2,
+    "pasaportes": 2,
+    "embarque": 2,
+}
 
 COLUMNAS = [
     "timestamp",
@@ -69,76 +93,56 @@ COLUMNAS = [
 
 
 # ============================================================
-# ESCENARIOS SINTÉTICOS
+# ESCENARIOS SINTETICOS
 # ============================================================
 
 ESCENARIOS = [
     {
-        "nombre": "mañana tranquila",
+        "nombre": "manana tranquila",
         "duracion_lecturas": 12,
-        "entrada": (8, 16),
-        "checkin": (4, 10),
-        "bagdrop": (2, 7),
-        "directo_seguridad": (2, 6),
-        "seguridad": (5, 14),
-        "con_pasaportes": (2, 6),
-        "sin_pasaportes": (3, 8),
-        "pasaportes": (2, 6),
-        "embarque": (4, 10),
+        "llegadas_min": (2, 5),
     },
     {
         "nombre": "subida de demanda",
         "duracion_lecturas": 12,
-        "entrada": (18, 35),
-        "checkin": (12, 25),
-        "bagdrop": (8, 18),
-        "directo_seguridad": (6, 14),
-        "seguridad": (18, 35),
-        "con_pasaportes": (8, 18),
-        "sin_pasaportes": (10, 22),
-        "pasaportes": (8, 20),
-        "embarque": (12, 28),
+        "llegadas_min": (5, 10),
     },
     {
         "nombre": "hora punta",
         "duracion_lecturas": 14,
-        "entrada": (35, 65),
-        "checkin": (28, 55),
-        "bagdrop": (18, 38),
-        "directo_seguridad": (12, 28),
-        "seguridad": (35, 70),
-        "con_pasaportes": (18, 36),
-        "sin_pasaportes": (18, 38),
-        "pasaportes": (18, 40),
-        "embarque": (25, 55),
+        "llegadas_min": (10, 18),
     },
     {
-        "nombre": "saturación crítica",
+        "nombre": "saturacion critica",
         "duracion_lecturas": 10,
-        "entrada": (65, 95),
-        "checkin": (55, 85),
-        "bagdrop": (35, 60),
-        "directo_seguridad": (25, 45),
-        "seguridad": (70, 110),
-        "con_pasaportes": (35, 60),
-        "sin_pasaportes": (35, 65),
-        "pasaportes": (35, 70),
-        "embarque": (45, 85),
+        "llegadas_min": (18, 28),
     },
     {
-        "nombre": "recuperación",
+        "nombre": "recuperacion",
         "duracion_lecturas": 14,
-        "entrada": (18, 35),
-        "checkin": (12, 26),
-        "bagdrop": (8, 18),
-        "directo_seguridad": (6, 14),
-        "seguridad": (16, 35),
-        "con_pasaportes": (7, 16),
-        "sin_pasaportes": (8, 20),
-        "pasaportes": (7, 18),
-        "embarque": (12, 30),
+        "llegadas_min": (4, 9),
     },
 ]
+
+
+# ============================================================
+# ESTADO DE SIMULACION
+# ============================================================
+
+@dataclass
+class EstadoSimulador:
+    reloj: datetime = field(default_factory=datetime.now)
+    entrada_acumulada: int = 0
+    colas: dict = field(default_factory=lambda: {
+        "checkin": 6,
+        "bagdrop": 3,
+        "seguridad": 8,
+        "pasaportes": 3,
+        "embarque": 5,
+    })
+    directo_seguridad_ultimo: int = 0
+    con_pasaportes_ultimo: int = 0
+    sin_pasaportes_ultimo: int = 0
 
 
 # ============================================================
@@ -146,10 +150,7 @@ ESCENARIOS = [
 # ============================================================
 
 def crear_csv_desde_cero():
-    """
-    Crea el CSV desde cero con la cabecera.
-    Esto deja limpio el archivo cada vez que arranca el simulador.
-    """
+    """Crea el CSV desde cero con la cabecera."""
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -158,29 +159,97 @@ def crear_csv_desde_cero():
         writer.writeheader()
 
 
-def generar_lectura(escenario: dict) -> dict:
+def repartir(total: int, ratios: list[float]) -> list[int]:
+    """Reparte un entero segun ratios y conserva la suma total."""
+
+    partes = [int(total * ratio) for ratio in ratios]
+    restante = total - sum(partes)
+
+    for _ in range(restante):
+        partes[random.randrange(len(partes))] += 1
+
+    return partes
+
+
+def capacidad_intervalo(zona: str) -> int:
+    """Personas que puede atender la zona durante una lectura simulada."""
+
+    mu = 1.0 / TIEMPOS_SERVICIO[zona]
+    capacidad = mu * CABINAS_SIMULADAS[zona] * MINUTOS_SIMULADOS_POR_LECTURA
+
+    # Redondeo estocastico para no perder siempre la parte decimal.
+    base = int(capacidad)
+    if random.random() < capacidad - base:
+        base += 1
+
+    return max(base, 0)
+
+
+def atender(estado: EstadoSimulador, zona: str) -> int:
+    """Saca de la cola tantas personas como permita la capacidad."""
+
+    atendidos = min(estado.colas[zona], capacidad_intervalo(zona))
+    estado.colas[zona] -= atendidos
+
+    return atendidos
+
+
+def generar_lectura(estado: EstadoSimulador, escenario: dict) -> dict:
     """
-    Genera una lectura sintética para el escenario actual.
+    Avanza una lectura manteniendo balance temporal entre zonas.
     """
 
-    lectura = {
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    llegadas = random.randint(*escenario["llegadas_min"])
+    estado.entrada_acumulada += llegadas
+
+    a_checkin, a_bagdrop, a_directo = repartir(
+        llegadas,
+        [RATIO_CHECKIN, RATIO_BAGDROP, RATIO_DIRECTO_SEGURIDAD],
+    )
+
+    estado.colas["checkin"] += a_checkin
+    estado.colas["bagdrop"] += a_bagdrop
+    estado.colas["seguridad"] += a_directo
+
+    salen_checkin = atender(estado, "checkin")
+    salen_bagdrop = atender(estado, "bagdrop")
+    estado.colas["seguridad"] += salen_checkin + salen_bagdrop
+
+    salen_seguridad = atender(estado, "seguridad")
+    con_pasaportes, sin_pasaportes = repartir(
+        salen_seguridad,
+        [RATIO_CON_PASAPORTES, 1.0 - RATIO_CON_PASAPORTES],
+    )
+
+    estado.colas["pasaportes"] += con_pasaportes
+    estado.colas["embarque"] += sin_pasaportes
+
+    salen_pasaportes = atender(estado, "pasaportes")
+    estado.colas["embarque"] += salen_pasaportes
+
+    atender(estado, "embarque")
+
+    estado.directo_seguridad_ultimo = a_directo
+    estado.con_pasaportes_ultimo = con_pasaportes
+    estado.sin_pasaportes_ultimo = sin_pasaportes
+    estado.reloj += timedelta(minutes=MINUTOS_SIMULADOS_POR_LECTURA)
+
+    return {
+        "timestamp": estado.reloj.strftime("%Y-%m-%d %H:%M:%S"),
+        "entrada": estado.entrada_acumulada,
+        "checkin": estado.colas["checkin"],
+        "bagdrop": estado.colas["bagdrop"],
+        "directo_seguridad": estado.directo_seguridad_ultimo,
+        "seguridad": estado.colas["seguridad"],
+        "con_pasaportes": estado.con_pasaportes_ultimo,
+        "sin_pasaportes": estado.sin_pasaportes_ultimo,
+        "pasaportes": estado.colas["pasaportes"],
+        "embarque": estado.colas["embarque"],
     }
-
-    for columna in COLUMNAS:
-        if columna == "timestamp":
-            continue
-
-        minimo, maximo = escenario[columna]
-        lectura[columna] = random.randint(minimo, maximo)
-
-    return lectura
 
 
 def escribir_lectura(lectura: dict):
-    """
-    Añade una fila al CSV.
-    """
+    """Anade una fila al CSV."""
 
     with open(OUTPUT_PATH, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=COLUMNAS)
@@ -188,13 +257,11 @@ def escribir_lectura(lectura: dict):
 
 
 def imprimir_lectura(lectura: dict):
-    """
-    Muestra en terminal la lectura generada.
-    """
+    """Muestra en terminal la lectura generada."""
 
     print(
         f"[{lectura['timestamp']}] "
-        f"entrada={lectura['entrada']} | "
+        f"entrada_acum={lectura['entrada']} | "
         f"checkin={lectura['checkin']} | "
         f"bagdrop={lectura['bagdrop']} | "
         f"directo_seguridad={lectura['directo_seguridad']} | "
@@ -206,12 +273,14 @@ def imprimir_lectura(lectura: dict):
 
 def main():
     crear_csv_desde_cero()
+    estado = EstadoSimulador()
 
     print("\nSIMULADOR DE LECTURAS DEL AEROPUERTO")
     print("====================================")
     print(f"Carpeta base del proyecto: {BASE_DIR}")
     print(f"Escribiendo CSV en:        {OUTPUT_PATH}")
-    print(f"Intervalo:                 {INTERVALO_SEGUNDOS} segundos")
+    print(f"Intervalo real:            {INTERVALO_SEGUNDOS} segundos")
+    print(f"Intervalo simulado:        {MINUTOS_SIMULADOS_POR_LECTURA:.1f} min")
     print("Pulsa Ctrl+C para parar.\n")
 
     try:
@@ -220,14 +289,14 @@ def main():
                 print(f"\nEscenario actual: {escenario['nombre']}")
 
                 for _ in range(escenario["duracion_lecturas"]):
-                    lectura = generar_lectura(escenario)
+                    lectura = generar_lectura(estado, escenario)
                     escribir_lectura(lectura)
                     imprimir_lectura(lectura)
 
                     time.sleep(INTERVALO_SEGUNDOS)
 
     except KeyboardInterrupt:
-        print("\nSimulación detenida.")
+        print("\nSimulacion detenida.")
 
 
 if __name__ == "__main__":
