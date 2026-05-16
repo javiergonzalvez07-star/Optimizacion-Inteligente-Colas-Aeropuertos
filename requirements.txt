@@ -6,3 +6,7 @@ matplotlib
 pillow
 torch
 torchvision
+streamlit>=1.33.0
+plotly
+networkx
+pyvis

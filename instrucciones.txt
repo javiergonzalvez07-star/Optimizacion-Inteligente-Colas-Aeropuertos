@@ -1,3 +1,41 @@
+DASHBOARD (STREAMLIT)
+=====================
+
+Requisitos:
+- Al menos 2 filas en outputs/lecturas_aeropuerto.csv (o la ruta que uses).
+- Python con dependencias (usa el MISMO intérprete en todos los comandos):
+
+    python -m pip install -r requirements.txt
+
+Lanzar interfaz (desde la raíz del proyecto):
+
+    python -m streamlit run dashboard/app.py
+
+En Windows, si «streamlit» no se reconoce como comando, es normal: pip instala
+el ejecutable en Scripts\ y esa carpeta no siempre está en el PATH. Usa siempre
+«python -m streamlit» con el mismo Python con el que hiciste pip install.
+
+Alternativa en PowerShell:
+
+    .\run_dashboard.ps1
+
+O en CMD:
+
+    run_dashboard.bat
+
+Flujo:
+1. Pantalla de configuracion: elegir airport_config.json y pulsar "Correr simulacion".
+2. El dashboard reprocesa las lecturas con el motor de colas y muestra el estado operativo.
+
+Si faltan lecturas, genera datos con el simulador (ver abajo) o con YOLO.
+
+Si no se abre el navegador:
+- Mira la terminal: cuando arranque veras algo como «Local URL: http://localhost:8501».
+  Abre esa URL manualmente en Chrome o Edge.
+- El arranque suele tardar unos segundos (pyvis/networkx); no cierres la terminal.
+- En .streamlit/config.toml debe estar headless = false para auto-abrir el navegador.
+
+
 SIMULADOR
 =========
 
