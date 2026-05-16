@@ -1,12 +1,17 @@
+# Entorno y cachés
 .venv/
-*/.venv/
-venv/
 __pycache__/
 *.pyc
 
+# YOLO / vídeos / modelos
 runs/
 *.pt
 *.avi
 *.mp4
 *.mov
 *.mkv
+
+# Outputs generados por el sistema
+outputs/*.csv
+outputs/*.xlsx
+outputs/*.png

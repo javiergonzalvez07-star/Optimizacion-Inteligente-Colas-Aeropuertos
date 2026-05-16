@@ -9,11 +9,16 @@ Terminal 2: aplicar sistema de colas
 
 python colas/queue_engine.py --watch
 
+Config experimental de zonas y conexiones:
+
+python colas/queue_engine.py --watch --config airport_config.json
+
 Cuando ya tengas datos suficientes, paras ambos con Ctrl+C.
 
 Para comparar:
 
 python colas/comparador_escenarios.py
+python colas/comparador_escenarios.py --config airport_config.json
 
 
 YOLO
@@ -30,10 +35,11 @@ Terminal 2: aplicar sistema de colas
 
 cd ..
 python colas/queue_engine.py --watch --csv aeropuerto_yolo/outputs/lecturas_aeropuerto.csv
+python colas/queue_engine.py --watch --csv aeropuerto_yolo/outputs/lecturas_aeropuerto.csv --config airport_config.json
 
 Cuando ya tengas datos suficientes, paras el watch con Ctrl+C.
 
 Para comparar:
 
 python colas/comparador_escenarios.py --csv aeropuerto_yolo/outputs/lecturas_aeropuerto.csv --output outputs/comparacion_escenarios_yolo.csv
-
+python colas/comparador_escenarios.py --csv aeropuerto_yolo/outputs/lecturas_aeropuerto.csv --output outputs/comparacion_escenarios_yolo.csv --config airport_config.json

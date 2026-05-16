@@ -73,9 +73,10 @@ Modo demo:
     python colas/queue_engine.py --demo
 """
 
-import math
 import argparse
 import csv
+import json
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -92,6 +93,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = BASE_DIR / "outputs"
 CSV_DEFAULT = OUTPUT_DIR / "lecturas_aeropuerto.csv"
 OUTPUT_INFORME_DEFAULT = OUTPUT_DIR / "informe_colas.csv"
+CONFIG_DEFAULT = BASE_DIR / "airport_config.json"
 
 
 # ============================================================
@@ -143,6 +145,22 @@ CABINAS_INICIALES = {
     "embarque": 2,
 }
 
+ZONAS_NOMBRES = {
+    "checkin": "Check-in",
+    "bagdrop": "Bag drop",
+    "seguridad": "Seguridad",
+    "pasaportes": "Pasaportes",
+    "embarque": "Embarque",
+}
+
+ZONA_CSV_COLUMNAS = {
+    "checkin": "checkin",
+    "bagdrop": "bagdrop",
+    "seguridad": "seguridad",
+    "pasaportes": "pasaportes",
+    "embarque": "embarque",
+}
+
 UMBRALES = {
     "abrir": 5.0,       # min
     "cerrar": 1.5,      # min
@@ -158,6 +176,51 @@ RATIO_ENTRADA = {
 
 RATIO_CON_PASAPORTES = 0.45
 RATIO_SIN_PASAPORTES = 0.55
+
+CONEXIONES_MODELO = [
+    {"from": "entrada", "to": "checkin", "probability": 0.35},
+    {"from": "entrada", "to": "bagdrop", "probability": 0.25},
+    {"from": "entrada", "to": "seguridad", "probability": 0.40},
+    {"from": "checkin", "to": "seguridad", "probability": 1.0},
+    {"from": "bagdrop", "to": "seguridad", "probability": 1.0},
+    {"from": "seguridad", "to": "pasaportes", "probability": 0.45},
+    {"from": "seguridad", "to": "embarque", "probability": 0.55},
+    {"from": "pasaportes", "to": "embarque", "probability": 1.0},
+]
+
+RUTAS_PASAJERO = {
+    "checkin_seguridad_pasaportes_embarque": [
+        "checkin",
+        "seguridad",
+        "pasaportes",
+        "embarque",
+    ],
+    "checkin_seguridad_embarque": [
+        "checkin",
+        "seguridad",
+        "embarque",
+    ],
+    "bagdrop_seguridad_pasaportes_embarque": [
+        "bagdrop",
+        "seguridad",
+        "pasaportes",
+        "embarque",
+    ],
+    "bagdrop_seguridad_embarque": [
+        "bagdrop",
+        "seguridad",
+        "embarque",
+    ],
+    "directo_seguridad_pasaportes_embarque": [
+        "seguridad",
+        "pasaportes",
+        "embarque",
+    ],
+    "directo_seguridad_embarque": [
+        "seguridad",
+        "embarque",
+    ],
+}
 
 WEATHER_DEFAULTS = {
     "weather_condition": "normal",
@@ -276,6 +339,135 @@ def limpiar_float(valor, default: float = 0.0) -> float:
 
 def limitar(valor: float, minimo: float, maximo: float) -> float:
     return max(minimo, min(valor, maximo))
+
+
+def cargar_configuracion_aeropuerto(config_path=None) -> bool:
+    """
+    Carga una configuracion externa de zonas y conexiones.
+
+    Mantiene las estructuras globales antiguas para no reescribir el motor:
+    ZONAS_MODELO, TIEMPOS_SERVICIO, CABINAS_CONFIG y CABINAS_INICIALES.
+    """
+
+    if config_path in ("", None):
+        return False
+
+    path = Path(config_path)
+
+    if not path.exists():
+        print(f"[AVISO] No se encontro configuracion externa: {path}")
+        print("[AVISO] Se usara la configuracion hardcodeada por defecto.")
+        return False
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            config = json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"[AVISO] No se pudo leer la configuracion {path}: {exc}")
+        print("[AVISO] Se usara la configuracion hardcodeada por defecto.")
+        return False
+
+    zonas = config.get("zones", [])
+
+    if not zonas:
+        print(f"[AVISO] Configuracion sin zonas validas: {path}")
+        print("[AVISO] Se usara la configuracion hardcodeada por defecto.")
+        return False
+
+    nuevas_zonas = []
+    nuevos_tiempos = {}
+    nuevas_cabinas_cfg = {}
+    nuevas_cabinas_iniciales = {}
+    nuevos_nombres = {}
+    nuevas_columnas = {}
+
+    for zona_cfg in zonas:
+        zona_id = str(zona_cfg.get("id", "")).strip()
+
+        if not zona_id:
+            continue
+
+        service_rate = limpiar_float(
+            zona_cfg.get("service_rate_per_server"),
+            default=0.0,
+        )
+
+        if service_rate <= 0:
+            service_time = limpiar_float(
+                zona_cfg.get("service_time_minutes"),
+                default=0.0,
+            )
+            service_rate = 1.0 / service_time if service_time > 0 else 0.0
+
+        if service_rate <= 0:
+            print(
+                f"[AVISO] Zona '{zona_id}' sin tasa de servicio valida. "
+                "Se ignora."
+            )
+            continue
+
+        servers_min = max(limpiar_entero(zona_cfg.get("servers_min")), 1)
+        servers_max = max(limpiar_entero(zona_cfg.get("servers_max")), servers_min)
+        servers_initial = limpiar_entero(zona_cfg.get("servers_initial"))
+        servers_initial = max(servers_min, min(servers_initial, servers_max))
+
+        nuevas_zonas.append(zona_id)
+        nuevos_tiempos[zona_id] = 1.0 / service_rate
+        nuevas_cabinas_cfg[zona_id] = {
+            "min": servers_min,
+            "max": servers_max,
+        }
+        nuevas_cabinas_iniciales[zona_id] = servers_initial
+        nuevos_nombres[zona_id] = str(zona_cfg.get("name", zona_id))
+        nuevas_columnas[zona_id] = str(zona_cfg.get("csv_column", zona_id))
+
+    if not nuevas_zonas:
+        print(f"[AVISO] Configuracion sin zonas utilizables: {path}")
+        print("[AVISO] Se usara la configuracion hardcodeada por defecto.")
+        return False
+
+    conexiones = []
+    for conexion in config.get("connections", []):
+        origen = str(conexion.get("from", "")).strip()
+        destino = str(conexion.get("to", "")).strip()
+        probabilidad = limpiar_float(conexion.get("probability"), default=0.0)
+
+        if origen and destino and probabilidad > 0:
+            conexiones.append({
+                "from": origen,
+                "to": destino,
+                "probability": probabilidad,
+            })
+
+    rutas = config.get("passenger_routes", {})
+    rutas_limpias = {
+        str(nombre): [str(zona) for zona in zonas_ruta]
+        for nombre, zonas_ruta in rutas.items()
+        if isinstance(zonas_ruta, list)
+    }
+
+    ZONAS_MODELO[:] = nuevas_zonas
+    TIEMPOS_SERVICIO.clear()
+    TIEMPOS_SERVICIO.update(nuevos_tiempos)
+    CABINAS_CONFIG.clear()
+    CABINAS_CONFIG.update(nuevas_cabinas_cfg)
+    CABINAS_INICIALES.clear()
+    CABINAS_INICIALES.update(nuevas_cabinas_iniciales)
+    ZONAS_NOMBRES.clear()
+    ZONAS_NOMBRES.update(nuevos_nombres)
+    ZONA_CSV_COLUMNAS.clear()
+    ZONA_CSV_COLUMNAS.update(nuevas_columnas)
+
+    if conexiones:
+        CONEXIONES_MODELO[:] = conexiones
+
+    if rutas_limpias:
+        RUTAS_PASAJERO.clear()
+        RUTAS_PASAJERO.update(rutas_limpias)
+
+    print(f"[OK] Configuracion de aeropuerto cargada: {path}")
+    print(f"[OK] Zonas activas: {', '.join(ZONAS_MODELO)}")
+    return True
 
 
 def normalizar_meteorologia(lectura: dict) -> dict:
@@ -502,6 +694,51 @@ def estimar_llegadas_por_balance(
     }
 
 
+def probabilidad_desde_origen(
+    origen: str,
+    destino: str,
+    conexiones: list[dict] | None = None,
+) -> float:
+    """
+    Suma probabilidades de rutas simples entre dos nodos.
+
+    Es una primera capa de grafo: suficiente para repartir flujo desde
+    'entrada' cuando falta una columna directa en el CSV.
+    """
+
+    conexiones = conexiones or CONEXIONES_MODELO
+
+    def visitar(nodo: str, acumulada: float, visitados: set[str]) -> float:
+        if nodo == destino:
+            return acumulada
+
+        total = 0.0
+
+        for conexion in conexiones:
+            if conexion.get("from") != nodo:
+                continue
+
+            siguiente = conexion.get("to")
+
+            if siguiente in visitados:
+                continue
+
+            prob = limpiar_float(conexion.get("probability"), default=0.0)
+
+            if prob <= 0:
+                continue
+
+            total += visitar(
+                nodo=siguiente,
+                acumulada=acumulada * prob,
+                visitados=visitados | {siguiente},
+            )
+
+        return total
+
+    return max(visitar(origen, 1.0, {origen}), 0.0)
+
+
 def estimar_lambda_fallback_desde_entrada(
     zona: str,
     lectura_anterior: dict,
@@ -528,6 +765,11 @@ def estimar_lambda_fallback_desde_entrada(
     # como diferencia positiva entre mediciones.
     llegadas_entrada = max(entrada_curr - entrada_prev, 0.0)
     lambda_entrada = llegadas_entrada / delta_t_min
+
+    probabilidad_config = probabilidad_desde_origen("entrada", zona)
+
+    if probabilidad_config > 0:
+        return lambda_entrada * probabilidad_config
 
     if zona == "checkin":
         return lambda_entrada * RATIO_ENTRADA["checkin"]
@@ -1046,14 +1288,15 @@ def ejecutar_analisis(
     weather_info = normalizar_meteorologia(lectura_actual)
 
     for zona in ZONAS_MODELO:
-        personas_anterior = lectura_anterior.get(zona, 0)
-        personas_actual = lectura_actual.get(zona, 0)
+        columna_csv = ZONA_CSV_COLUMNAS.get(zona, zona)
+        personas_anterior = lectura_anterior.get(columna_csv, 0)
+        personas_actual = lectura_actual.get(columna_csv, 0)
         c_actual = estado.cabinas[zona]
 
         lambda_forzada = None
 
         # Si la zona no existe en el CSV, usamos fallback desde entrada.
-        if zona not in lectura_actual or zona not in lectura_anterior:
+        if columna_csv not in lectura_actual or columna_csv not in lectura_anterior:
             lambda_forzada = estimar_lambda_fallback_desde_entrada(
                 zona=zona,
                 lectura_anterior=lectura_anterior,
@@ -1118,43 +1361,9 @@ def calcular_experiencia_pasajero(resultados: list[ResultadoCola]) -> dict:
 
     mapa = resultados_por_zona(resultados)
 
-    rutas = {
-        "checkin_seguridad_pasaportes_embarque": [
-            "checkin",
-            "seguridad",
-            "pasaportes",
-            "embarque",
-        ],
-        "checkin_seguridad_embarque": [
-            "checkin",
-            "seguridad",
-            "embarque",
-        ],
-        "bagdrop_seguridad_pasaportes_embarque": [
-            "bagdrop",
-            "seguridad",
-            "pasaportes",
-            "embarque",
-        ],
-        "bagdrop_seguridad_embarque": [
-            "bagdrop",
-            "seguridad",
-            "embarque",
-        ],
-        "directo_seguridad_pasaportes_embarque": [
-            "seguridad",
-            "pasaportes",
-            "embarque",
-        ],
-        "directo_seguridad_embarque": [
-            "seguridad",
-            "embarque",
-        ],
-    }
-
     experiencia = {}
 
-    for nombre, zonas in rutas.items():
+    for nombre, zonas in RUTAS_PASAJERO.items():
         experiencia[nombre] = sumar_tiempo_total_zonas(mapa, zonas)
 
     return experiencia
@@ -1658,7 +1867,15 @@ def main():
         help="Leer continuamente el CSV",
     )
 
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=CONFIG_DEFAULT,
+        help="Ruta al JSON experimental de zonas y conexiones",
+    )
+
     args = parser.parse_args()
+    cargar_configuracion_aeropuerto(args.config)
 
     if args.demo:
         modo_demo()

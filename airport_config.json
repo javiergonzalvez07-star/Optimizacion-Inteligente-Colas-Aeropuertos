@@ -1,0 +1,126 @@
+{
+  "airport_name": "Demo aeropuerto actual",
+  "description": "Configuracion experimental compatible con las columnas CSV actuales.",
+  "zones": [
+    {
+      "id": "checkin",
+      "name": "Check-in manual",
+      "csv_column": "checkin",
+      "servers_initial": 4,
+      "servers_min": 2,
+      "servers_max": 12,
+      "service_rate_per_server": 0.285714
+    },
+    {
+      "id": "bagdrop",
+      "name": "Bag drop autoservicio",
+      "csv_column": "bagdrop",
+      "servers_initial": 2,
+      "servers_min": 1,
+      "servers_max": 8,
+      "service_rate_per_server": 0.5
+    },
+    {
+      "id": "seguridad",
+      "name": "Seguridad",
+      "csv_column": "seguridad",
+      "servers_initial": 2,
+      "servers_min": 1,
+      "servers_max": 6,
+      "service_rate_per_server": 0.833333
+    },
+    {
+      "id": "pasaportes",
+      "name": "Pasaportes y eGates",
+      "csv_column": "pasaportes",
+      "servers_initial": 2,
+      "servers_min": 1,
+      "servers_max": 8,
+      "service_rate_per_server": 0.5
+    },
+    {
+      "id": "embarque",
+      "name": "Embarque",
+      "csv_column": "embarque",
+      "servers_initial": 2,
+      "servers_min": 1,
+      "servers_max": 4,
+      "service_rate_per_server": 2.0
+    }
+  ],
+  "connections": [
+    {
+      "from": "entrada",
+      "to": "checkin",
+      "probability": 0.35
+    },
+    {
+      "from": "entrada",
+      "to": "bagdrop",
+      "probability": 0.25
+    },
+    {
+      "from": "entrada",
+      "to": "seguridad",
+      "probability": 0.4
+    },
+    {
+      "from": "checkin",
+      "to": "seguridad",
+      "probability": 1.0
+    },
+    {
+      "from": "bagdrop",
+      "to": "seguridad",
+      "probability": 1.0
+    },
+    {
+      "from": "seguridad",
+      "to": "pasaportes",
+      "probability": 0.45
+    },
+    {
+      "from": "seguridad",
+      "to": "embarque",
+      "probability": 0.55
+    },
+    {
+      "from": "pasaportes",
+      "to": "embarque",
+      "probability": 1.0
+    }
+  ],
+  "passenger_routes": {
+    "checkin_seguridad_pasaportes_embarque": [
+      "checkin",
+      "seguridad",
+      "pasaportes",
+      "embarque"
+    ],
+    "checkin_seguridad_embarque": [
+      "checkin",
+      "seguridad",
+      "embarque"
+    ],
+    "bagdrop_seguridad_pasaportes_embarque": [
+      "bagdrop",
+      "seguridad",
+      "pasaportes",
+      "embarque"
+    ],
+    "bagdrop_seguridad_embarque": [
+      "bagdrop",
+      "seguridad",
+      "embarque"
+    ],
+    "directo_seguridad_pasaportes_embarque": [
+      "seguridad",
+      "pasaportes",
+      "embarque"
+    ],
+    "directo_seguridad_embarque": [
+      "seguridad",
+      "embarque"
+    ]
+  }
+}
