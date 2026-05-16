@@ -211,9 +211,29 @@ def saturacion_segura(resultado) -> float:
     """
     Devuelve saturacion en escala 0..1.
 
-    El motor devuelve rho ya calculado desde lambda / (servidores * mu).
-    Si algun dato viniera invalido, usamos 0.0 para no romper la comparacion.
+    Preferimos calcularla aqui como lambda / capacidad para no depender del
+    rho mostrado por el motor, que se recorta a 1.0 para la salida visual.
+    Si algun dato viniera invalido, usamos el rho disponible o 0.0.
     """
+
+    lambda_arr = getattr(resultado, "lambda_arr", None)
+    capacidad = getattr(resultado, "capacidad_actual", None)
+
+    try:
+        lambda_arr = float(lambda_arr)
+        capacidad = float(capacidad)
+    except (TypeError, ValueError):
+        lambda_arr = None
+        capacidad = None
+
+    if (
+        lambda_arr is not None
+        and capacidad is not None
+        and math.isfinite(lambda_arr)
+        and math.isfinite(capacidad)
+        and capacidad > 0
+    ):
+        return max(lambda_arr / capacidad, 0.0)
 
     rho = getattr(resultado, "rho", 0.0)
 

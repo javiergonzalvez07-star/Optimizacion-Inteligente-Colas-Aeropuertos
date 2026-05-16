@@ -2,6 +2,7 @@
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # YOLO / vídeos / modelos
 runs/
@@ -15,3 +16,8 @@ runs/
 outputs/*.csv
 outputs/*.xlsx
 outputs/*.png
+outputs/*.log
+outputs/*.tmp
+
+# Sistema
+.DS_Store

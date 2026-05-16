@@ -17,6 +17,8 @@ class DashboardFilters:
     thresholds: SaturationThresholds
     visible_nodes: list[str]
     show_weather: bool
+    auto_refresh: bool
+    refresh_interval_seconds: int
     lecturas_path: Path
     informe_path: Path
 
@@ -44,6 +46,16 @@ def render_sidebar_filters(config: AirportConfigView) -> DashboardFilters:
 
         show_weather = st.checkbox("Mostrar panel meteorológico", value=True)
 
+        auto_refresh = st.checkbox("Autoactualizar", value=True)
+        refresh_interval_seconds = st.number_input(
+            "Intervalo autoactualizacion (s)",
+            min_value=2,
+            max_value=60,
+            value=5,
+            step=1,
+            disabled=not auto_refresh,
+        )
+
         all_nodes = config.graph_node_ids()
         visible_nodes = st.multiselect(
             "Zonas visibles en tabla y gráfico",
@@ -69,6 +81,8 @@ def render_sidebar_filters(config: AirportConfigView) -> DashboardFilters:
         thresholds=SaturationThresholds(attention=attention, critical=critical),
         visible_nodes=visible_nodes or config.graph_node_ids(),
         show_weather=show_weather,
+        auto_refresh=auto_refresh,
+        refresh_interval_seconds=int(refresh_interval_seconds),
         lecturas_path=lecturas_path,
         informe_path=informe_path,
     )

@@ -8,6 +8,7 @@ Ejecución desde la raíz del proyecto:
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -51,6 +52,44 @@ def init_session_state() -> None:
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+
+def informe_necesita_reprocesado(lecturas_path: Path, informe_path: Path) -> bool:
+    """Devuelve True si hay lecturas nuevas o no existe el informe."""
+
+    if not lecturas_path.exists():
+        return False
+
+    if not informe_path.exists():
+        return True
+
+    return lecturas_path.stat().st_mtime > informe_path.stat().st_mtime
+
+
+def reprocesar_si_hay_lecturas_nuevas(
+    config_path: Path,
+    lecturas_path: Path,
+    informe_path: Path,
+) -> None:
+    """Ejecuta queue_engine solo cuando el CSV de lecturas cambio."""
+
+    if not informe_necesita_reprocesado(lecturas_path, informe_path):
+        return
+
+    loader = ReportLoader(lecturas_path, informe_path)
+    lecturas_status = loader.check_lecturas()
+    if not lecturas_status.has_minimum_rows:
+        st.sidebar.warning(lecturas_status.message)
+        return
+
+    result = QueueRunnerAdapter().run(config_path, lecturas_path, informe_path)
+    st.session_state["last_run_message"] = result.message
+    st.session_state["last_run_success"] = result.success
+
+    if result.success:
+        st.sidebar.caption("Informe actualizado con las ultimas lecturas.")
+    else:
+        st.sidebar.warning(result.message)
 
 
 def render_config_page() -> None:
@@ -149,6 +188,16 @@ def render_dashboard_page() -> None:
 
     st.sidebar.markdown(f"**Configuración activa**  \n{config.airport_name}")
     filters = render_sidebar_filters(config)
+
+    if filters.auto_refresh:
+        reprocesar_si_hay_lecturas_nuevas(
+            config_path=config_path,
+            lecturas_path=filters.lecturas_path,
+            informe_path=filters.informe_path,
+        )
+        st.sidebar.caption(
+            f"Autoactualizacion activa cada {filters.refresh_interval_seconds}s."
+        )
 
     loader = ReportLoader(filters.lecturas_path, filters.informe_path)
     informe_status = loader.load_informe()
@@ -254,6 +303,10 @@ def render_dashboard_page() -> None:
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.caption("No hay datos de saturación para las zonas seleccionadas.")
+
+    if filters.auto_refresh:
+        time.sleep(filters.refresh_interval_seconds)
+        st.rerun()
 
 
 def main() -> None:

@@ -124,7 +124,7 @@ ZONAS_MODELO = [
 TIEMPOS_SERVICIO = {
     "checkin": 3.5,      # min/persona/cabina
     "bagdrop": 2.0,
-    "seguridad": 1.2,
+    "seguridad": 1.0,
     "pasaportes": 2.0,
     "embarque": 0.5,
 }
@@ -132,17 +132,17 @@ TIEMPOS_SERVICIO = {
 CABINAS_CONFIG = {
     "checkin": {"min": 2, "max": 12},
     "bagdrop": {"min": 1, "max": 8},
-    "seguridad": {"min": 1, "max": 6},
+    "seguridad": {"min": 1, "max": 8},
     "pasaportes": {"min": 1, "max": 8},
     "embarque": {"min": 1, "max": 4},
 }
 
 CABINAS_INICIALES = {
-    "checkin": 4,
-    "bagdrop": 2,
-    "seguridad": 2,
-    "pasaportes": 2,
-    "embarque": 2,
+    "checkin": 6,
+    "bagdrop": 3,
+    "seguridad": 5,
+    "pasaportes": 5,
+    "embarque": 3,
 }
 
 ZONAS_NOMBRES = {
@@ -166,6 +166,11 @@ UMBRALES = {
     "cerrar": 1.5,      # min
     "critico": 10.0,    # min
 }
+
+# Para la demo las recomendaciones representan decisiones operativas graduales.
+# Evita saltos poco creibles como cerrar cinco puestos o abrir media terminal.
+MAX_APERTURA_RECOMENDADA = 2
+MAX_CIERRE_RECOMENDADO = 1
 
 # Se usan solo como fallback si falta una columna concreta.
 RATIO_ENTRADA = {
@@ -672,7 +677,18 @@ def estimar_llegadas_por_balance(
     mu = 1.0 / TIEMPOS_SERVICIO[zona]
     capacidad_actual = mu * cabinas_activas
 
-    atendidos_estimados = capacidad_actual * delta_t_min
+    capacidad_intervalo = capacidad_actual * delta_t_min
+
+    # Si dos lecturas consecutivas muestran la zona vacia, no asumimos que la
+    # zona haya trabajado a plena capacidad. Antes eso inventaba llegadas iguales
+    # a la capacidad y hacia que el dashboard pareciera siempre al 100%.
+    if personas_anterior <= 0 and personas_actual <= 0:
+        atendidos_estimados = 0.0
+    else:
+        atendidos_estimados = min(
+            capacidad_intervalo,
+            max(float(personas_anterior), float(personas_actual)),
+        )
 
     llegadas_estimadas = (
         personas_actual
@@ -1047,6 +1063,14 @@ def calcular_cola_mmc(
         zona=zona,
         lambda_arr=lambda_arr,
         personas_actuales=personas_actual,
+    )
+    c_rec = max(
+        c_actual - MAX_CIERRE_RECOMENDADO,
+        min(c_rec, c_actual + MAX_APERTURA_RECOMENDADA),
+    )
+    c_rec = max(
+        CABINAS_CONFIG[zona]["min"],
+        min(c_rec, CABINAS_CONFIG[zona]["max"]),
     )
 
     weather = normalizar_meteorologia(weather_info or {})
