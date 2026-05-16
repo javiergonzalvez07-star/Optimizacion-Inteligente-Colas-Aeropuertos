@@ -76,22 +76,22 @@ Modo demo:
 import math
 import argparse
 import csv
-import os
 import time
 from dataclasses import dataclass, field
-from typing import Optional
 from datetime import datetime
+from pathlib import Path
+from typing import Optional
 
 
 # ============================================================
 # RUTAS
 # ============================================================
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = Path(__file__).resolve().parent.parent
 
-OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
-CSV_DEFAULT = os.path.join(OUTPUT_DIR, "lecturas_aeropuerto.csv")
-OUTPUT_INFORME_DEFAULT = os.path.join(OUTPUT_DIR, "informe_colas.csv")
+OUTPUT_DIR = BASE_DIR / "outputs"
+CSV_DEFAULT = OUTPUT_DIR / "lecturas_aeropuerto.csv"
+OUTPUT_INFORME_DEFAULT = OUTPUT_DIR / "informe_colas.csv"
 
 
 # ============================================================
@@ -159,6 +159,27 @@ RATIO_ENTRADA = {
 RATIO_CON_PASAPORTES = 0.45
 RATIO_SIN_PASAPORTES = 0.55
 
+WEATHER_DEFAULTS = {
+    "weather_condition": "normal",
+    "tiempo_atmosferico": "Normal",
+    "weather_risk_score": 0.0,
+    "weather_delay_multiplier": 1.0,
+    "recommended_extra_boarding_buffer_minutes": 0,
+}
+
+WEATHER_TEXT_COLUMNS = {
+    "weather_condition",
+    "tiempo_atmosferico",
+}
+
+WEATHER_NUMERIC_COLUMNS = {
+    "weather_risk_score",
+    "weather_delay_multiplier",
+    "recommended_extra_boarding_buffer_minutes",
+}
+
+BOARDING_AREA_CAPACITY = 80
+
 
 # ============================================================
 # DATACLASS
@@ -191,6 +212,15 @@ class ResultadoCola:
     tiempo_total_nuevo_actual: float
 
     predicciones: dict
+
+    weather_condition: str
+    tiempo_atmosferico: str
+    weather_risk_score: float
+    weather_delay_multiplier: float
+    recommended_extra_boarding_buffer_minutes: int
+    boarding_base_pressure: float
+    boarding_adjusted_pressure: float
+    boarding_weather_risk_level: str
 
     cabinas_recomendadas: int
     accion: str
@@ -232,6 +262,52 @@ def limpiar_entero(valor) -> int:
         return int(float(valor))
     except ValueError:
         return 0
+
+
+def limpiar_float(valor, default: float = 0.0) -> float:
+    if valor in ("", "None", "null", None):
+        return default
+
+    try:
+        return float(valor)
+    except (TypeError, ValueError):
+        return default
+
+
+def limitar(valor: float, minimo: float, maximo: float) -> float:
+    return max(minimo, min(valor, maximo))
+
+
+def normalizar_meteorologia(lectura: dict) -> dict:
+    weather = WEATHER_DEFAULTS.copy()
+
+    for columna in WEATHER_TEXT_COLUMNS:
+        valor = lectura.get(columna, WEATHER_DEFAULTS[columna])
+        weather[columna] = str(valor).strip() or WEATHER_DEFAULTS[columna]
+
+    weather["weather_risk_score"] = limitar(
+        limpiar_float(
+            lectura.get("weather_risk_score"),
+            WEATHER_DEFAULTS["weather_risk_score"],
+        ),
+        0.0,
+        1.0,
+    )
+    weather["weather_delay_multiplier"] = max(
+        limpiar_float(
+            lectura.get("weather_delay_multiplier"),
+            WEATHER_DEFAULTS["weather_delay_multiplier"],
+        ),
+        1.0,
+    )
+    weather["recommended_extra_boarding_buffer_minutes"] = limpiar_entero(
+        lectura.get(
+            "recommended_extra_boarding_buffer_minutes",
+            WEATHER_DEFAULTS["recommended_extra_boarding_buffer_minutes"],
+        )
+    )
+
+    return weather
 
 
 def parsear_timestamp(ts: str) -> Optional[datetime]:
@@ -594,6 +670,43 @@ def construir_predicciones(
 
 
 # ============================================================
+# METEOROLOGIA Y PRESION DE EMBARQUE
+# ============================================================
+
+def compute_weather_adjusted_boarding_pressure(
+    current_boarding_occupancy,
+    boarding_capacity,
+    weather_risk_score,
+    weather_delay_multiplier
+):
+    if boarding_capacity <= 0:
+        return {
+            "base_pressure": 0.0,
+            "adjusted_pressure": 0.0,
+            "risk_level": "Unknown",
+        }
+
+    base_pressure = current_boarding_occupancy / boarding_capacity
+
+    adjusted_pressure = base_pressure * (
+        1 + 0.15 * weather_risk_score * weather_delay_multiplier
+    )
+
+    if adjusted_pressure < 0.7:
+        risk_level = "Low"
+    elif adjusted_pressure < 0.9:
+        risk_level = "Moderate"
+    else:
+        risk_level = "High"
+
+    return {
+        "base_pressure": base_pressure,
+        "adjusted_pressure": adjusted_pressure,
+        "risk_level": risk_level,
+    }
+
+
+# ============================================================
 # RECOMENDACIÓN DE CABINAS
 # ============================================================
 
@@ -642,7 +755,8 @@ def calcular_cola_mmc(
     personas_actual: int,
     delta_t_min: float,
     c_actual: int,
-    lambda_forzada: Optional[float] = None
+    lambda_forzada: Optional[float] = None,
+    weather_info: Optional[dict] = None,
 ) -> ResultadoCola:
     """
     Calcula métricas M/M/c para una zona usando balance temporal.
@@ -692,6 +806,21 @@ def calcular_cola_mmc(
         lambda_arr=lambda_arr,
         personas_actuales=personas_actual,
     )
+
+    weather = normalizar_meteorologia(weather_info or {})
+    boarding_pressure = compute_weather_adjusted_boarding_pressure(
+        current_boarding_occupancy=personas_actual if zona == "embarque" else 0,
+        boarding_capacity=BOARDING_AREA_CAPACITY if zona == "embarque" else 0,
+        weather_risk_score=weather["weather_risk_score"],
+        weather_delay_multiplier=weather["weather_delay_multiplier"],
+    )
+
+    if zona == "embarque" and boarding_pressure["risk_level"] in {"Moderate", "High"}:
+        incremento = 1 if boarding_pressure["risk_level"] == "Moderate" else 2
+        c_rec = max(
+            c_rec,
+            min(c_actual + incremento, CABINAS_CONFIG[zona]["max"]),
+        )
 
     Wq = metricas["Wq"]
     rho = metricas["rho"]
@@ -744,6 +873,23 @@ def calcular_cola_mmc(
             f"Espera de pasajero nuevo ahora: {espera_nuevo_actual:.1f} min."
         )
 
+    if zona == "embarque" and boarding_pressure["risk_level"] in {"Moderate", "High"}:
+        if boarding_pressure["risk_level"] == "High":
+            accion = "CRITICO"
+        elif accion == "CERRAR":
+            accion = "OK"
+            c_rec = max(c_actual, c_rec)
+
+        mensaje = (
+            f"{mensaje} Meteo: {weather['tiempo_atmosferico']} "
+            f"(riesgo {weather['weather_risk_score']:.2f}, "
+            f"multiplicador {weather['weather_delay_multiplier']:.2f}). "
+            f"Presion de embarque ajustada: "
+            f"{boarding_pressure['adjusted_pressure']:.0%} "
+            f"({boarding_pressure['risk_level']}). Reservar "
+            f"{weather['recommended_extra_boarding_buffer_minutes']} min extra."
+        )
+
     rho_mostrado = min(rho, 1.0) if math.isfinite(rho) else 1.0
 
     return ResultadoCola(
@@ -773,6 +919,17 @@ def calcular_cola_mmc(
 
         predicciones=predicciones,
 
+        weather_condition=weather["weather_condition"],
+        tiempo_atmosferico=weather["tiempo_atmosferico"],
+        weather_risk_score=weather["weather_risk_score"],
+        weather_delay_multiplier=weather["weather_delay_multiplier"],
+        recommended_extra_boarding_buffer_minutes=weather[
+            "recommended_extra_boarding_buffer_minutes"
+        ],
+        boarding_base_pressure=boarding_pressure["base_pressure"],
+        boarding_adjusted_pressure=boarding_pressure["adjusted_pressure"],
+        boarding_weather_risk_level=boarding_pressure["risk_level"],
+
         cabinas_recomendadas=c_rec,
         accion=accion,
         mensaje=mensaje,
@@ -792,17 +949,25 @@ def normalizar_fila_csv(row: dict) -> dict:
 
         k = k.strip()
 
-        if k == "timestamp":
+        if k == "timestamp" or k in WEATHER_TEXT_COLUMNS:
             resultado[k] = v
             continue
 
-        resultado[k] = limpiar_entero(v)
+        if k in WEATHER_NUMERIC_COLUMNS:
+            resultado[k] = limpiar_float(v, WEATHER_DEFAULTS.get(k, 0.0))
+        else:
+            resultado[k] = limpiar_entero(v)
+
+    for k, v in WEATHER_DEFAULTS.items():
+        resultado.setdefault(k, v)
 
     return resultado
 
 
 def leer_todas_lecturas_csv(csv_path: str) -> list[dict]:
-    if not os.path.exists(csv_path):
+    csv_path = Path(csv_path)
+
+    if not csv_path.exists():
         print(f"[ERROR] No se encontró el CSV: {csv_path}")
         return []
 
@@ -878,6 +1043,7 @@ def ejecutar_analisis(
 
     resultados = []
     delta_t_min = calcular_delta_t_min(lectura_anterior, lectura_actual)
+    weather_info = normalizar_meteorologia(lectura_actual)
 
     for zona in ZONAS_MODELO:
         personas_anterior = lectura_anterior.get(zona, 0)
@@ -902,6 +1068,7 @@ def ejecutar_analisis(
             delta_t_min=delta_t_min,
             c_actual=c_actual,
             lambda_forzada=lambda_forzada,
+            weather_info=weather_info,
         )
 
         resultados.append(resultado)
@@ -1005,12 +1172,10 @@ def guardar_experiencia_pasajero_csv(
         outputs/experiencia_pasajero.csv
     """
 
-    output_experiencia = os.path.join(
-        os.path.dirname(output_path),
-        "experiencia_pasajero.csv"
-    )
+    output_path = Path(output_path)
+    output_experiencia = output_path.parent / "experiencia_pasajero.csv"
 
-    os.makedirs(os.path.dirname(output_experiencia), exist_ok=True)
+    output_experiencia.parent.mkdir(parents=True, exist_ok=True)
 
     campos = [
         "timestamp_procesado",
@@ -1019,7 +1184,7 @@ def guardar_experiencia_pasajero_csv(
         "tiempo_total_estimado_desde_entrada_min",
     ]
 
-    es_nuevo = not os.path.exists(output_experiencia)
+    es_nuevo = not output_experiencia.exists()
 
     experiencia = calcular_experiencia_pasajero(resultados)
 
@@ -1066,6 +1231,16 @@ def imprimir_informe(
     print(f"  Timestamp: {timestamp or datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * ancho)
 
+    if resultados:
+        r0 = resultados[0]
+        print(
+            "  Meteo: "
+            f"{r0.tiempo_atmosferico} "
+            f"(riesgo {r0.weather_risk_score:.2f}, "
+            f"multiplicador {r0.weather_delay_multiplier:.2f}, "
+            f"buffer embarque {r0.recommended_extra_boarding_buffer_minutes} min)"
+        )
+
     for r in resultados:
         color = COLORES.get(r.accion, "")
         reset = COLORES["RESET"]
@@ -1091,6 +1266,11 @@ def imprimir_informe(
         print(f"  Tiempo total medio modelo W:      {formato_float(r.W)} min")
         print(f"  Espera pasajero nuevo ahora:      {formato_float(r.espera_nuevo_actual)} min")
         print(f"  Total pasajero nuevo ahora:       {formato_float(r.tiempo_total_nuevo_actual)} min")
+
+        if r.zona == "embarque":
+            print(f"  PresiÃ³n embarque base:            {r.boarding_base_pressure:.0%}")
+            print(f"  PresiÃ³n embarque ajustada meteo:  {r.boarding_adjusted_pressure:.0%}")
+            print(f"  Riesgo meteo en embarque:         {r.boarding_weather_risk_level}")
 
         print("  Predicciones:")
         print(
@@ -1148,7 +1328,8 @@ def guardar_informe_csv(
     desde pandas, Excel o Streamlit.
     """
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     campos = [
         "timestamp_procesado",
@@ -1177,6 +1358,15 @@ def guardar_informe_csv(
         "espera_estimada_pasajero_nuevo_ahora_min",
         "tiempo_total_estimado_pasajero_nuevo_ahora_min",
 
+        "weather_condition",
+        "tiempo_atmosferico",
+        "weather_risk_score",
+        "weather_delay_multiplier",
+        "recommended_extra_boarding_buffer_minutes",
+        "boarding_base_pressure",
+        "boarding_adjusted_pressure",
+        "boarding_weather_risk_level",
+
         "personas_predichas_en_5_min",
         "espera_pasajero_nuevo_predicha_en_5_min",
         "tiempo_total_pasajero_nuevo_predicho_en_5_min",
@@ -1194,7 +1384,7 @@ def guardar_informe_csv(
         "mensaje_recomendacion",
     ]
 
-    es_nuevo = not os.path.exists(output_path)
+    es_nuevo = not output_path.exists()
 
     with open(output_path, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=campos)
@@ -1235,6 +1425,15 @@ def guardar_informe_csv(
 
                 "espera_estimada_pasajero_nuevo_ahora_min": redondear_csv(r.espera_nuevo_actual),
                 "tiempo_total_estimado_pasajero_nuevo_ahora_min": redondear_csv(r.tiempo_total_nuevo_actual),
+
+                "weather_condition": r.weather_condition,
+                "tiempo_atmosferico": r.tiempo_atmosferico,
+                "weather_risk_score": redondear_csv(r.weather_risk_score),
+                "weather_delay_multiplier": redondear_csv(r.weather_delay_multiplier),
+                "recommended_extra_boarding_buffer_minutes": r.recommended_extra_boarding_buffer_minutes,
+                "boarding_base_pressure": redondear_csv(r.boarding_base_pressure),
+                "boarding_adjusted_pressure": redondear_csv(r.boarding_adjusted_pressure),
+                "boarding_weather_risk_level": r.boarding_weather_risk_level,
 
                 "personas_predichas_en_5_min": redondear_csv(pred_5.get("personas", 0)),
                 "espera_pasajero_nuevo_predicha_en_5_min": redondear_csv(pred_5.get("espera_nuevo", 0)),
@@ -1498,7 +1697,7 @@ def main():
     )
 
     print(f"Informe de colas guardado en: {args.output_csv}")
-    print(f"Experiencia de pasajero guardada en: {os.path.join(os.path.dirname(args.output_csv), 'experiencia_pasajero.csv')}")
+    print(f"Experiencia de pasajero guardada en: {Path(args.output_csv).parent / 'experiencia_pasajero.csv'}")
 
 
 if __name__ == "__main__":

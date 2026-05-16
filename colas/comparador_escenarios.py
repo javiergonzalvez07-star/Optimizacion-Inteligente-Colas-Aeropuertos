@@ -28,16 +28,16 @@ Uso:
 import argparse
 import csv
 import math
-import os
 import sys
 from datetime import datetime
+from pathlib import Path
 
 
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-BASE_DIR = os.path.dirname(CURRENT_DIR)
+CURRENT_DIR = Path(__file__).resolve().parent
+BASE_DIR = CURRENT_DIR.parent
 
-if CURRENT_DIR not in sys.path:
-    sys.path.insert(0, CURRENT_DIR)
+if str(CURRENT_DIR) not in sys.path:
+    sys.path.insert(0, str(CURRENT_DIR))
 
 from queue_engine import (  # noqa: E402
     CABINAS_INICIALES,
@@ -48,12 +48,13 @@ from queue_engine import (  # noqa: E402
     ejecutar_analisis,
     estimar_lambda_fallback_desde_entrada,
     leer_todas_lecturas_csv,
+    normalizar_meteorologia,
 )
 
 
-CSV_DEFAULT = os.path.join(BASE_DIR, "outputs", "lecturas_aeropuerto.csv")
-OUTPUT_DEFAULT = os.path.join(BASE_DIR, "outputs", "comparacion_escenarios.csv")
-RESUMEN_DEFAULT = os.path.join(BASE_DIR, "outputs", "resumen_comparacion_escenarios.csv")
+CSV_DEFAULT = BASE_DIR / "outputs" / "lecturas_aeropuerto.csv"
+OUTPUT_DEFAULT = BASE_DIR / "outputs" / "comparacion_escenarios.csv"
+RESUMEN_DEFAULT = BASE_DIR / "outputs" / "resumen_comparacion_escenarios.csv"
 
 
 CAMPOS_COMPARACION = [
@@ -66,6 +67,14 @@ CAMPOS_COMPARACION = [
 
     "cabinas_baseline",
     "cabinas_recomendado",
+
+    "weather_condition",
+    "tiempo_atmosferico",
+    "weather_risk_score",
+    "weather_delay_multiplier",
+    "recommended_extra_boarding_buffer_minutes",
+    "boarding_adjusted_pressure_recomendado",
+    "boarding_weather_risk_level_recomendado",
 
     "espera_pasajero_nuevo_baseline_min",
     "espera_pasajero_nuevo_recomendado_min",
@@ -179,6 +188,7 @@ def resultados_baseline(lectura_anterior: dict, lectura_actual: dict):
 
     resultados = []
     delta_t_min = calcular_delta_t_min(lectura_anterior, lectura_actual)
+    weather_info = normalizar_meteorologia(lectura_actual)
 
     for zona in ZONAS_MODELO:
         personas_anterior = lectura_anterior.get(zona, 0)
@@ -201,6 +211,7 @@ def resultados_baseline(lectura_anterior: dict, lectura_actual: dict):
                 delta_t_min=delta_t_min,
                 c_actual=CABINAS_INICIALES[zona],
                 lambda_forzada=lambda_forzada,
+                weather_info=weather_info,
             )
         )
 
@@ -236,6 +247,16 @@ def construir_fila_comparacion(timestamp: str, baseline, recomendado) -> dict:
 
         "cabinas_baseline": baseline.c_activas,
         "cabinas_recomendado": recomendado.c_activas,
+
+        "weather_condition": recomendado.weather_condition,
+        "tiempo_atmosferico": recomendado.tiempo_atmosferico,
+        "weather_risk_score": valor_csv(recomendado.weather_risk_score),
+        "weather_delay_multiplier": valor_csv(recomendado.weather_delay_multiplier),
+        "recommended_extra_boarding_buffer_minutes": recomendado.recommended_extra_boarding_buffer_minutes,
+        "boarding_adjusted_pressure_recomendado": valor_csv(
+            recomendado.boarding_adjusted_pressure
+        ),
+        "boarding_weather_risk_level_recomendado": recomendado.boarding_weather_risk_level,
 
         "espera_pasajero_nuevo_baseline_min": valor_csv(espera_base),
         "espera_pasajero_nuevo_recomendado_min": valor_csv(espera_rec),
@@ -294,10 +315,11 @@ def procesar_comparacion(lecturas: list[dict]):
 
 
 def guardar_csv(path: str, campos: list[str], filas: list[dict]):
-    output_dir = os.path.dirname(path)
+    path = Path(path)
+    output_dir = path.parent
 
     if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=campos)
@@ -424,10 +446,7 @@ def main():
 
     filas = procesar_comparacion(lecturas)
     resumen = calcular_resumen(filas, total_mediciones=len(lecturas) - 1)
-    resumen_path = os.path.join(
-        os.path.dirname(args.output),
-        "resumen_comparacion_escenarios.csv",
-    )
+    resumen_path = Path(args.output).parent / "resumen_comparacion_escenarios.csv"
 
     guardar_csv(args.output, CAMPOS_COMPARACION, filas)
     guardar_csv(resumen_path, CAMPOS_RESUMEN, [resumen])

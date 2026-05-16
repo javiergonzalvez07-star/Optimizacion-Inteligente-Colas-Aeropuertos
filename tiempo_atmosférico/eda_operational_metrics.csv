@@ -1,0 +1,21 @@
+﻿metric,value
+total_flights,28820
+bad_weather_flights,6374
+bad_weather_flight_percentage,22.116585704371964
+avg_departure_delay_bad_weather,10.199874490116096
+avg_departure_delay_normal_weather,5.288826516974071
+median_departure_delay_bad_weather,-2.0
+median_departure_delay_normal_weather,-3.0
+p75_departure_delay_bad_weather,6.0
+p75_departure_delay_normal_weather,1.0
+p90_departure_delay_bad_weather,37.0
+p90_departure_delay_normal_weather,21.0
+delayed_15_percentage_bad_weather,18.13617822403514
+delayed_15_percentage_normal_weather,12.76396685378241
+avg_arrival_delay_bad_weather,
+avg_arrival_delay_normal_weather,
+cancellation_percentage_bad_weather,
+cancellation_percentage_normal_weather,
+recommended_extra_boarding_buffer_minutes,1.0
+weather_delay_multiplier,1.9285704413597997
+boarding_saturation_risk_comment,High risk

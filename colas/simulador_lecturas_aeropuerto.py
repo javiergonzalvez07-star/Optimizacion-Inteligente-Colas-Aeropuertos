@@ -27,21 +27,21 @@ Mientras este script funciona, en otra terminal:
 """
 
 import csv
-import os
 import random
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 
 
 # ============================================================
 # RUTAS
 # ============================================================
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = Path(__file__).resolve().parent.parent
 
-OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
-OUTPUT_PATH = os.path.join(OUTPUT_DIR, "lecturas_aeropuerto.csv")
+OUTPUT_DIR = BASE_DIR / "outputs"
+OUTPUT_PATH = OUTPUT_DIR / "lecturas_aeropuerto.csv"
 
 
 # ============================================================
@@ -78,6 +78,50 @@ CABINAS_SIMULADAS = {
     "embarque": 2,
 }
 
+WEATHER_LABELS = {
+    "normal": "Normal",
+    "rain": "Lluvia",
+    "storm": "Tormenta",
+    "low_visibility": "Baja visibilidad",
+    "wind": "Viento",
+}
+
+WEATHER_PROBABILITIES = [
+    ("normal", 0.55),
+    ("rain", 0.20),
+    ("wind", 0.10),
+    ("low_visibility", 0.10),
+    ("storm", 0.05),
+]
+
+WEATHER_RANGES = {
+    "normal": {
+        "risk": (0.0, 0.2),
+        "delay_multiplier": (1.0, 1.1),
+        "boarding_buffer": (0, 5),
+    },
+    "rain": {
+        "risk": (0.3, 0.5),
+        "delay_multiplier": (1.2, 1.5),
+        "boarding_buffer": (5, 15),
+    },
+    "wind": {
+        "risk": (0.4, 0.6),
+        "delay_multiplier": (1.3, 1.7),
+        "boarding_buffer": (10, 20),
+    },
+    "low_visibility": {
+        "risk": (0.5, 0.7),
+        "delay_multiplier": (1.5, 2.0),
+        "boarding_buffer": (15, 30),
+    },
+    "storm": {
+        "risk": (0.7, 1.0),
+        "delay_multiplier": (1.8, 2.5),
+        "boarding_buffer": (25, 45),
+    },
+}
+
 COLUMNAS = [
     "timestamp",
     "entrada",
@@ -89,6 +133,11 @@ COLUMNAS = [
     "sin_pasaportes",
     "pasaportes",
     "embarque",
+    "weather_condition",
+    "tiempo_atmosferico",
+    "weather_risk_score",
+    "weather_delay_multiplier",
+    "recommended_extra_boarding_buffer_minutes",
 ]
 
 
@@ -143,6 +192,9 @@ class EstadoSimulador:
     directo_seguridad_ultimo: int = 0
     con_pasaportes_ultimo: int = 0
     sin_pasaportes_ultimo: int = 0
+    weather_condition: str = "normal"
+    weather_remaining_reads: int = 0
+    weather_metrics: dict = field(default_factory=dict)
 
 
 # ============================================================
@@ -152,11 +204,58 @@ class EstadoSimulador:
 def crear_csv_desde_cero():
     """Crea el CSV desde cero con la cabecera."""
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     with open(OUTPUT_PATH, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=COLUMNAS)
         writer.writeheader()
+
+
+def elegir_condicion_meteorologica() -> str:
+    """Elige una condicion con mayor peso en tiempo normal."""
+
+    condiciones = [item[0] for item in WEATHER_PROBABILITIES]
+    pesos = [item[1] for item in WEATHER_PROBABILITIES]
+
+    return random.choices(condiciones, weights=pesos, k=1)[0]
+
+
+def muestrear_metricas_meteorologicas(condition: str) -> dict:
+    rangos = WEATHER_RANGES[condition]
+    risk_min, risk_max = rangos["risk"]
+    delay_min, delay_max = rangos["delay_multiplier"]
+    buffer_min, buffer_max = rangos["boarding_buffer"]
+
+    return {
+        "weather_condition": condition,
+        "tiempo_atmosferico": WEATHER_LABELS[condition],
+        "weather_risk_score": round(random.uniform(risk_min, risk_max), 2),
+        "weather_delay_multiplier": round(random.uniform(delay_min, delay_max), 2),
+        "recommended_extra_boarding_buffer_minutes": random.randint(
+            buffer_min,
+            buffer_max,
+        ),
+    }
+
+
+def actualizar_meteorologia(estado: EstadoSimulador) -> dict:
+    """
+    Mantiene la meteorologia durante varios ciclos y solo la reevalua
+    al final de cada bloque de lecturas.
+    """
+
+    if estado.weather_remaining_reads <= 0 or not estado.weather_metrics:
+        if not estado.weather_metrics or random.random() < 0.65:
+            estado.weather_condition = elegir_condicion_meteorologica()
+
+        estado.weather_remaining_reads = random.randint(5, 15)
+        estado.weather_metrics = muestrear_metricas_meteorologicas(
+            estado.weather_condition
+        )
+
+    estado.weather_remaining_reads -= 1
+
+    return estado.weather_metrics.copy()
 
 
 def repartir(total: int, ratios: list[float]) -> list[int]:
@@ -233,8 +332,9 @@ def generar_lectura(estado: EstadoSimulador, escenario: dict) -> dict:
     estado.con_pasaportes_ultimo = con_pasaportes
     estado.sin_pasaportes_ultimo = sin_pasaportes
     estado.reloj += timedelta(minutes=MINUTOS_SIMULADOS_POR_LECTURA)
+    meteorologia = actualizar_meteorologia(estado)
 
-    return {
+    lectura = {
         "timestamp": estado.reloj.strftime("%Y-%m-%d %H:%M:%S"),
         "entrada": estado.entrada_acumulada,
         "checkin": estado.colas["checkin"],
@@ -246,6 +346,9 @@ def generar_lectura(estado: EstadoSimulador, escenario: dict) -> dict:
         "pasaportes": estado.colas["pasaportes"],
         "embarque": estado.colas["embarque"],
     }
+    lectura.update(meteorologia)
+
+    return lectura
 
 
 def escribir_lectura(lectura: dict):
@@ -267,7 +370,9 @@ def imprimir_lectura(lectura: dict):
         f"directo_seguridad={lectura['directo_seguridad']} | "
         f"seguridad={lectura['seguridad']} | "
         f"pasaportes={lectura['pasaportes']} | "
-        f"embarque={lectura['embarque']}"
+        f"embarque={lectura['embarque']} | "
+        f"tiempo={lectura['tiempo_atmosferico']} | "
+        f"riesgo={lectura['weather_risk_score']}"
     )
 
 
