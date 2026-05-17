@@ -1,50 +1,50 @@
 {
-  "airport_name": "Demo aeropuerto internacional grande",
-  "description": "Ejemplo sintetico para probar mayor afluencia sin usar datos reales.",
+  "airport_name": "Demo aeropuerto actual",
+  "description": "Configuracion experimental compatible con las columnas CSV actuales.",
   "zones": [
     {
       "id": "checkin",
       "name": "Check-in manual",
       "csv_column": "checkin",
-      "servers_initial": 8,
-      "servers_min": 3,
-      "servers_max": 18,
+      "servers_initial": 6,
+      "servers_min": 2,
+      "servers_max": 12,
       "service_rate_per_server": 0.285714
     },
     {
       "id": "bagdrop",
       "name": "Bag drop autoservicio",
       "csv_column": "bagdrop",
-      "servers_initial": 5,
-      "servers_min": 2,
-      "servers_max": 12,
+      "servers_initial": 3,
+      "servers_min": 1,
+      "servers_max": 8,
       "service_rate_per_server": 0.5
     },
     {
       "id": "seguridad",
       "name": "Seguridad",
       "csv_column": "seguridad",
-      "servers_initial": 8,
-      "servers_min": 2,
-      "servers_max": 12,
+      "servers_initial": 5,
+      "servers_min": 1,
+      "servers_max": 8,
       "service_rate_per_server": 1.0
     },
     {
       "id": "pasaportes",
       "name": "Pasaportes y eGates",
       "csv_column": "pasaportes",
-      "servers_initial": 6,
-      "servers_min": 2,
-      "servers_max": 12,
+      "servers_initial": 5,
+      "servers_min": 1,
+      "servers_max": 8,
       "service_rate_per_server": 0.5
     },
     {
       "id": "embarque",
       "name": "Embarque",
       "csv_column": "embarque",
-      "servers_initial": 4,
+      "servers_initial": 3,
       "servers_min": 1,
-      "servers_max": 8,
+      "servers_max": 4,
       "service_rate_per_server": 2.0
     }
   ],
@@ -52,17 +52,17 @@
     {
       "from": "entrada",
       "to": "checkin",
-      "probability": 0.4
+      "probability": 0.35
     },
     {
       "from": "entrada",
       "to": "bagdrop",
-      "probability": 0.3
+      "probability": 0.25
     },
     {
       "from": "entrada",
       "to": "seguridad",
-      "probability": 0.3
+      "probability": 0.4
     },
     {
       "from": "checkin",
@@ -77,12 +77,12 @@
     {
       "from": "seguridad",
       "to": "pasaportes",
-      "probability": 0.6
+      "probability": 0.45
     },
     {
       "from": "seguridad",
       "to": "embarque",
-      "probability": 0.4
+      "probability": 0.55
     },
     {
       "from": "pasaportes",

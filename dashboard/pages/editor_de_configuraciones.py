@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 import pandas as pd
 import streamlit as st
@@ -16,7 +17,7 @@ from dashboard.adapters.config_writer import (
     validate_config_payload,
 )
 from dashboard.adapters.graph_builder import build_graph_html
-from dashboard.paths import DEFAULT_CONFIG_JSON
+from dashboard.paths import CUSTOM_CONFIG_DIR, DEFAULT_CONFIG_JSON, DEFAULT_CUSTOM_CONFIG_JSON
 
 
 def _zone_columns() -> list[str]:
@@ -35,6 +36,19 @@ def _zone_columns() -> list[str]:
 
 def _connection_columns() -> list[str]:
     return ["from", "to", "probability"]
+
+
+def _normalize_config_file_name(name: str) -> str | None:
+    candidate = str(name or "").strip()
+    if not candidate:
+        return None
+    if not candidate.lower().endswith(".json"):
+        candidate += ".json"
+    if "/" in candidate or "\\" in candidate:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", candidate):
+        return None
+    return candidate
 
 
 def _load_template_data(template_path: Path) -> tuple[dict[str, str], pd.DataFrame, pd.DataFrame]:
@@ -155,7 +169,8 @@ def render_config_editor_page() -> None:
     )
 
     st.markdown("#### Guardar configuración")
-    save_button = st.button("Guardar airport_config_custom.json", type="primary")
+    save_name = st.text_input("Guardar como", value=DEFAULT_CUSTOM_CONFIG_JSON.name)
+    save_button = st.button("Guardar configuración", type="primary")
 
     payload = _build_payload(airport_name, description, zone_editor, connection_editor)
     validation_errors = validate_config_payload(payload)
@@ -171,14 +186,19 @@ def render_config_editor_page() -> None:
         if validation_errors:
             st.error("Corrige los errores antes de guardar.")
         else:
-            success, saved_path = save_custom_config(payload, DEFAULT_CUSTOM_CONFIG_JSON)
-            if success:
-                st.success(f"Configuración guardada en {saved_path}.")
-                st.session_state["config_path"] = str(Path(saved_path).resolve())
-                st.session_state["page"] = "config"
-                st.rerun()
+            normalized_name = _normalize_config_file_name(save_name)
+            if normalized_name is None:
+                st.error(
+                    "Nombre de archivo inválido. Usa solo letras, números, guiones, guion bajo y termina en .json"
+                )
             else:
-                st.error(f"No se pudo guardar la configuración: {saved_path}")
+                target_path = CUSTOM_CONFIG_DIR / normalized_name
+                success, saved_path = save_custom_config(payload, target_path)
+                if success:
+                    st.success(f"Configuración guardada en {saved_path}.")
+                    st.session_state["config_path"] = str(Path(saved_path).resolve())
+                else:
+                    st.error(f"No se pudo guardar la configuración: {saved_path}")
 
     if not validation_errors and payload["zones"] and payload["connections"]:
         st.markdown("#### Vista previa del grafo")
@@ -189,9 +209,6 @@ def render_config_editor_page() -> None:
         except Exception as exc:
             st.warning(f"No se pudo generar la vista previa del grafo: {exc}")
 
-    if st.button("Volver a configuración", type="secondary"):
-        st.session_state["page"] = "config"
-        st.rerun()
 
 
 if __name__ == "__main__":

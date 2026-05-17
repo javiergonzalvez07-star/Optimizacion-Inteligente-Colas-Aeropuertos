@@ -32,7 +32,7 @@ from dashboard.components.metrics_carousel import render_metrics_carousel
 from dashboard.components.recommendation_banner import render_recommendation_banner
 from dashboard.components.sidebar_filters import render_sidebar_filters
 from dashboard.components.weather_panel import render_weather_panel
-from dashboard.pages.editor_de_configuraciones import render_config_editor_page
+from dashboard.pages.Editor_de_configuraciones import render_config_editor_page
 from dashboard.paths import (
     DEFAULT_CONFIG_JSON,
     DEFAULT_CUSTOM_CONFIG_JSON,
@@ -105,9 +105,8 @@ def render_config_page() -> None:
     )
 
     configs = discover_config_files()
-    if not configs:
-        st.error("No se encontró ningún archivo airport_config*.json en el proyecto.")
-        return
+    if DEFAULT_CONFIG_JSON not in configs and DEFAULT_CONFIG_JSON.exists():
+        configs.insert(0, DEFAULT_CONFIG_JSON)
 
     if not configs:
         st.error("No se encontró ningún archivo airport_config*.json en el proyecto.")
@@ -117,13 +116,21 @@ def render_config_page() -> None:
     if current_config.exists() and current_config not in configs:
         configs.append(current_config)
 
-    labels = [path.name for path in configs]
+    config_entries: list[tuple[Path, AirportConfigView | None]] = []
+    for config_path in configs:
+        try:
+            preview = AirportConfigView.load(config_path)
+        except OSError:
+            preview = None
+        config_entries.append((config_path, preview))
+
+    labels = [config_path.name for config_path, _ in config_entries]
     default_index = 0
-    for index, path in enumerate(configs):
-        if path.resolve() == current_config:
+    for index, (config_path, _) in enumerate(config_entries):
+        if config_path.resolve() == current_config:
             default_index = index
             break
-        if path.name == "airport_config.json":
+        if config_path.name == "airport_config.json":
             default_index = index
 
     selected_label = st.selectbox(
@@ -131,15 +138,17 @@ def render_config_page() -> None:
         options=labels,
         index=default_index,
     )
-    config_path = configs[labels.index(selected_label)]
+    config_path, config_preview = config_entries[labels.index(selected_label)]
     st.session_state["config_path"] = str(config_path)
 
-    try:
-        config_preview = AirportConfigView.load(config_path)
-        st.info(f"**{config_preview.airport_name}** — {config_preview.description}")
-    except OSError as exc:
-        st.error(f"No se pudo leer la configuración: {exc}")
-        return
+    if config_preview is None:
+        try:
+            config_preview = AirportConfigView.load(config_path)
+        except OSError as exc:
+            st.error(f"No se pudo leer la configuración: {exc}")
+            return
+
+    st.info(f"**{config_preview.airport_name}** — {config_preview.description}")
 
     lecturas_path = Path(
         st.text_input(
@@ -227,9 +236,6 @@ def render_config_page() -> None:
                 st.error(result.message)
 
     st.markdown("---")
-    if st.button("Editar/Crear configuración custom", use_container_width=True):
-        st.session_state["page"] = "editor"
-        st.rerun()
 
     if st.session_state.get("ready"):
         informe_status = loader.load_informe()
@@ -466,9 +472,7 @@ def main() -> None:
     apply_dashboard_styles()
     init_session_state()
 
-    if st.session_state.get("page") == "editor":
-        render_config_editor_page()
-    elif st.session_state.get("page") == "dashboard" and st.session_state.get("ready"):
+    if st.session_state.get("page") == "dashboard" and st.session_state.get("ready"):
         render_dashboard_page()
     else:
         render_config_page()
