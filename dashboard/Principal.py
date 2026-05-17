@@ -2,7 +2,7 @@
 Dashboard operativo del aeropuerto.
 
 Ejecución desde la raíz del proyecto:
-    streamlit run dashboard/app.py
+    streamlit run dashboard/Principal.py
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from dashboard.components.metrics_carousel import render_metrics_carousel
 from dashboard.components.recommendation_banner import render_recommendation_banner
 from dashboard.components.sidebar_filters import render_sidebar_filters
 from dashboard.components.weather_panel import render_weather_panel
-from dashboard.pages.config_editor import render_config_editor_page
+from dashboard.pages.editor_de_configuraciones import render_config_editor_page
 from dashboard.paths import (
     DEFAULT_CONFIG_JSON,
     DEFAULT_CUSTOM_CONFIG_JSON,

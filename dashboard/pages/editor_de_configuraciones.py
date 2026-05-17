@@ -95,7 +95,7 @@ def _build_payload(
 
 
 def render_config_editor_page() -> None:
-    st.title("Editor de configuración JSON")
+    st.title("Editor de configuraciones")
     st.markdown(
         '<p class="subtitle">Crea y guarda una configuración custom para el motor de colas.</p>',
         unsafe_allow_html=True,
@@ -195,4 +195,9 @@ def render_config_editor_page() -> None:
 
 
 if __name__ == "__main__":
+    st.set_page_config(
+        page_title="Editor de configuraciones",
+        page_icon="🛠",
+        layout="wide",
+    )
     render_config_editor_page()
