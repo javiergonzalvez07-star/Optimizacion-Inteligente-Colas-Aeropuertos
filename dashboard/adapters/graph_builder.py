@@ -63,7 +63,17 @@ def build_graph_html(
         label = f"{conn.probability:.0%}" if conn.probability else ""
         graph.add_edge(conn.from_zone, conn.to_zone, label=label)
 
-    pos = nx.spring_layout(graph, seed=42, k=1.4)
+    fixed_positions: dict[str, tuple[float, float]] = {}
+    fixed_nodes: set[str] = set()
+    for zone in config.zones:
+        if zone.position_x is not None and zone.position_y is not None:
+            fixed_positions[zone.id] = (zone.position_x, zone.position_y)
+            fixed_nodes.add(zone.id)
+
+    if fixed_positions:
+        pos = nx.spring_layout(graph, pos=fixed_positions, fixed=fixed_nodes, seed=42, k=1.4)
+    else:
+        pos = nx.spring_layout(graph, seed=42, k=1.4)
 
     net = Network(
         height=height,

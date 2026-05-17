@@ -26,13 +26,16 @@ from dashboard.adapters.queue_runner import QueueRunnerAdapter
 from dashboard.adapters.recommendations import pick_main_recommendation
 from dashboard.adapters.report_loader import ReportLoader
 from dashboard.adapters.saturation import parse_utilization
+from dashboard.adapters.simulator_adapter import SimulatorAdapter
 from dashboard.adapters.zone_table import build_zone_table
 from dashboard.components.metrics_carousel import render_metrics_carousel
 from dashboard.components.recommendation_banner import render_recommendation_banner
 from dashboard.components.sidebar_filters import render_sidebar_filters
 from dashboard.components.weather_panel import render_weather_panel
+from dashboard.pages.config_editor import render_config_editor_page
 from dashboard.paths import (
     DEFAULT_CONFIG_JSON,
+    DEFAULT_CUSTOM_CONFIG_JSON,
     DEFAULT_INFORME_CSV,
     DEFAULT_LECTURAS_CSV,
 )
@@ -48,6 +51,8 @@ def init_session_state() -> None:
         "informe_path": str(DEFAULT_INFORME_CSV),
         "last_run_message": "",
         "last_run_success": False,
+        "expanded_map": False,
+        "simulator_process": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -71,7 +76,7 @@ def reprocesar_si_hay_lecturas_nuevas(
     lecturas_path: Path,
     informe_path: Path,
 ) -> None:
-    """Ejecuta queue_engine solo cuando el CSV de lecturas cambio."""
+    """Ejecuta queue_engine solo cuando el CSV de lecturas cambió."""
 
     if not informe_necesita_reprocesado(lecturas_path, informe_path):
         return
@@ -87,7 +92,7 @@ def reprocesar_si_hay_lecturas_nuevas(
     st.session_state["last_run_success"] = result.success
 
     if result.success:
-        st.sidebar.caption("Informe actualizado con las ultimas lecturas.")
+        st.sidebar.caption("Informe actualizado con las últimas lecturas.")
     else:
         st.sidebar.warning(result.message)
 
@@ -95,7 +100,7 @@ def reprocesar_si_hay_lecturas_nuevas(
 def render_config_page() -> None:
     st.title("Configuración del aeropuerto")
     st.markdown(
-        '<p class="subtitle">Selecciona la arquitectura y reprocesa las lecturas con el motor de colas.</p>',
+        '<p class="subtitle">Selecciona la configuración, inicia el simulador continuo o reprocesa las lecturas con el motor de colas.</p>',
         unsafe_allow_html=True,
     )
 
@@ -104,12 +109,22 @@ def render_config_page() -> None:
         st.error("No se encontró ningún archivo airport_config*.json en el proyecto.")
         return
 
+    if not configs:
+        st.error("No se encontró ningún archivo airport_config*.json en el proyecto.")
+        return
+
+    current_config = Path(st.session_state.get("config_path", DEFAULT_CONFIG_JSON)).resolve()
+    if current_config.exists() and current_config not in configs:
+        configs.append(current_config)
+
     labels = [path.name for path in configs]
     default_index = 0
     for index, path in enumerate(configs):
-        if path.name == "airport_config.json":
+        if path.resolve() == current_config:
             default_index = index
             break
+        if path.name == "airport_config.json":
+            default_index = index
 
     selected_label = st.selectbox(
         "Configuración existente",
@@ -174,12 +189,129 @@ def render_config_page() -> None:
                 with st.expander("Detalle del error"):
                     st.code(result.stderr)
 
+    st.markdown("---")
+    st.markdown("### Simulación continua")
+    st.info(
+        "Inicia o detén el simulador de lecturas continuo. El motor de colas se puede reprocesar cuando haya nuevas lecturas."
+    )
+
+    sim_adapter = SimulatorAdapter()
+    simulator_process = st.session_state.get("simulator_process")
+    simulator_running = SimulatorAdapter.is_running(simulator_process)
+
+    if simulator_running:
+        st.success(f"Simulador activo (PID {simulator_process.pid}).")
+        if st.button("Detener simulador continuo", use_container_width=True):
+            result = sim_adapter.stop(simulator_process)
+            st.session_state["simulator_process"] = None
+            st.success(result.message)
+    else:
+        demand = st.selectbox(
+            "Perfil de demanda",
+            options=["low", "medium", "high", "peak", "regional", "international_large", "peak_hour"],
+            index=1,
+        )
+        interval = st.number_input(
+            "Intervalo real entre lecturas (s)",
+            min_value=1,
+            max_value=10,
+            value=3,
+            step=1,
+        )
+        if st.button("Iniciar simulador continuo", use_container_width=True):
+            result = sim_adapter.start(config_path=config_path, demand=demand, interval=int(interval))
+            if result.success and result.process is not None:
+                st.session_state["simulator_process"] = result.process
+                st.success(result.message)
+            else:
+                st.error(result.message)
+
+    st.markdown("---")
+    if st.button("Editar/Crear configuración custom", use_container_width=True):
+        st.session_state["page"] = "editor"
+        st.rerun()
+
     if st.session_state.get("ready"):
         informe_status = loader.load_informe()
         if informe_status.exists and not informe_status.latest_measurement.empty:
             if st.button("Ir al dashboard sin reprocesar", use_container_width=True):
                 st.session_state["page"] = "dashboard"
                 st.rerun()
+
+
+def render_expanded_dashboard(
+    config: AirportConfigView,
+    informe: pd.DataFrame,
+    metrics_by_zone: dict[str, pd.Series],
+    recommendation,
+    filters,
+) -> None:
+    st.markdown("#### Vista mapa ampliado")
+    tab_zones, tab_chart = st.tabs(["Tabla por zonas", "Gráfico saturación"])
+
+    with tab_zones:
+        zone_table = build_zone_table(
+            config=config,
+            metrics_by_zone=metrics_by_zone,
+            node_ids=filters.visible_nodes,
+            thresholds=filters.thresholds,
+        )
+        display_cols = [
+            "Zona",
+            "Personas",
+            "Servidores activos",
+            "Espera estimada",
+            "Saturación",
+            "Estado",
+            "Recomendación",
+        ]
+        st.dataframe(zone_table[display_cols], use_container_width=True, hide_index=True, height=420)
+
+    with tab_chart:
+        chart_rows = []
+        for _, row in informe.iterrows():
+            zone_id = str(row.get("zona_aeropuerto", ""))
+            if zone_id not in filters.visible_nodes:
+                continue
+            rho = parse_utilization(row.get("utilizacion_puesto_porcentaje"))
+            if rho is None:
+                continue
+            chart_rows.append({"Zona": config.display_name(zone_id), "Saturación": rho})
+
+        if chart_rows:
+            chart_df = pd.DataFrame(chart_rows)
+            fig = px.bar(
+                chart_df,
+                x="Zona",
+                y="Saturación",
+                range_y=[0, 1],
+                color="Saturación",
+                color_continuous_scale=["#16a34a", "#f59e0b", "#dc2626"],
+            )
+            fig.update_layout(
+                margin=dict(l=10, r=10, t=10, b=10),
+                coloraxis_showscale=False,
+                plot_bgcolor="rgba(0,0,0,0)",
+                paper_bgcolor="rgba(0,0,0,0)",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.caption("No hay datos de saturación para las zonas seleccionadas.")
+
+    st.markdown("#### Recomendación principal")
+    render_recommendation_banner(recommendation)
+
+    st.markdown("#### Mapa operativo")
+    try:
+        graph_html = build_graph_html(
+            config=config,
+            metrics_by_zone=metrics_by_zone,
+            thresholds=filters.thresholds,
+            height="620px",
+        )
+        components.html(graph_html, height=660, scrolling=True)
+    except Exception as exc:
+        st.error(f"No se pudo generar el grafo: {exc}")
 
 
 def render_dashboard_page() -> None:
@@ -196,7 +328,7 @@ def render_dashboard_page() -> None:
             informe_path=filters.informe_path,
         )
         st.sidebar.caption(
-            f"Autoactualizacion activa cada {filters.refresh_interval_seconds}s."
+            f"Autoactualización activa cada {filters.refresh_interval_seconds}s."
         )
 
     loader = ReportLoader(filters.lecturas_path, filters.informe_path)
@@ -218,12 +350,22 @@ def render_dashboard_page() -> None:
 
     informe = informe_status.latest_measurement
     recommendation = pick_main_recommendation(informe, config)
-    zone_table = build_zone_table(
-        config=config,
-        metrics_by_zone=metrics_by_zone,
-        node_ids=filters.visible_nodes,
-        thresholds=filters.thresholds,
-    )
+
+    if st.button(
+        "Volver a vista normal" if st.session_state.get("expanded_map", False) else "Ampliar mapa",
+        use_container_width=True,
+    ):
+        st.session_state["expanded_map"] = not st.session_state.get("expanded_map", False)
+        st.rerun()
+
+    if st.session_state.get("expanded_map", False):
+        render_expanded_dashboard(config, informe, metrics_by_zone, recommendation, filters)
+        if filters.show_weather:
+            render_weather_panel(informe)
+        if filters.auto_refresh:
+            time.sleep(filters.refresh_interval_seconds)
+            st.rerun()
+        return
 
     st.markdown("#### Indicadores")
     render_metrics_carousel(informe, config, filters.thresholds)
@@ -234,6 +376,12 @@ def render_dashboard_page() -> None:
     table_col, _ = st.columns([1, 1.6], gap="large")
     with table_col:
         st.markdown("#### Tabla por zonas")
+        zone_table = build_zone_table(
+            config=config,
+            metrics_by_zone=metrics_by_zone,
+            node_ids=filters.visible_nodes,
+            thresholds=filters.thresholds,
+        )
         display_cols = [
             "Zona",
             "Personas",
@@ -318,7 +466,9 @@ def main() -> None:
     apply_dashboard_styles()
     init_session_state()
 
-    if st.session_state.get("page") == "dashboard" and st.session_state.get("ready"):
+    if st.session_state.get("page") == "editor":
+        render_config_editor_page()
+    elif st.session_state.get("page") == "dashboard" and st.session_state.get("ready"):
         render_dashboard_page()
     else:
         render_config_page()

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from dashboard.paths import BASE_DIR
+from dashboard.paths import BASE_DIR, CUSTOM_CONFIG_DIR
 
 
 @dataclass
@@ -19,6 +19,8 @@ class ZoneView:
     servers_min: int
     servers_max: int
     service_rate_per_server: float
+    position_x: float | None = None
+    position_y: float | None = None
 
 
 @dataclass
@@ -47,6 +49,8 @@ class AirportConfigView:
             zone_id = str(zone_cfg.get("id", "")).strip()
             if not zone_id:
                 continue
+            position_x = zone_cfg.get("position_x")
+            position_y = zone_cfg.get("position_y")
             zones.append(
                 ZoneView(
                     id=zone_id,
@@ -57,6 +61,16 @@ class AirportConfigView:
                     servers_max=int(zone_cfg.get("servers_max", 1)),
                     service_rate_per_server=float(
                         zone_cfg.get("service_rate_per_server", 0.0)
+                    ),
+                    position_x=(
+                        float(position_x)
+                        if position_x is not None and position_x != ""
+                        else None
+                    ),
+                    position_y=(
+                        float(position_y)
+                        if position_y is not None and position_y != ""
+                        else None
                     ),
                 )
             )
@@ -104,5 +118,15 @@ class AirportConfigView:
 
 def discover_config_files(base_dir: Path | None = None) -> list[Path]:
     root = base_dir or BASE_DIR
-    configs = sorted(root.glob("airport_config*.json"))
-    return [path for path in configs if path.is_file()]
+    configs: list[Path] = []
+
+    configs.extend(sorted(root.glob("airport_config*.json")))
+    if CUSTOM_CONFIG_DIR.exists():
+        configs.extend(sorted(CUSTOM_CONFIG_DIR.glob("airport_config*.json")))
+
+    unique_configs: dict[str, Path] = {}
+    for path in configs:
+        if path.is_file():
+            unique_configs[str(path.resolve())] = path
+
+    return sorted(unique_configs.values(), key=lambda p: p.name)
